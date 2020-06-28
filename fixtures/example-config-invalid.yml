@@ -1,0 +1,31 @@
+kafka_clusters:
+  cluster_1:
+    - "replicator-kafka-1:9092"
+  cluster_2:
+    - "replicator-kafka-2:9092"
+brod_clients:
+  - client: cl_1_client_1
+    cluster: l2_cluster
+    config: [] # optional
+  - client: cl_2_client_1
+    cluster: l3_cluster
+
+routes:
+  - upstream_client: cl_1_client_1
+    downstream_client: cl_2_client_1
+    upstream_topics:
+      - "topic1"
+    downstream_topic: "topic2"
+    repartitioning_strategy: strict_p2p # strict_p2p | random
+    default_begin_offset: earliest # optional
+    upstream_cg_id: group_1
+
+
+  - upstream_client: cl_2_client_1
+    downstream_client: cl_1_client_1
+    upstream_topics:
+      - "topic2"
+    downstream_topic: "topic3"
+    repartitioning_strategy: strict_p2p # strict_p2p | random
+    default_begin_offset: earliest # optional
+    upstream_cg_id: group_2

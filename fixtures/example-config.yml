@@ -1,0 +1,56 @@
+clusters:
+  - name: cluster_1
+    hosts:
+      - replicator-kafka-1:9092
+      - replicator-kafka-1:9092
+      - kafka_replicator_replicator_kafka_1_1:9092
+  - name: cluster_2
+    hosts:
+      - kafka_replicator_replicator_kafka_2_1:9092
+      - replicator-kafka-2:9092
+
+clients:
+  - client: cl_1_client_1
+    cluster: cluster_1
+    config: # optional
+       message.timeout.ms: 5000
+       auto.offset.reset: earliest
+  - client: cl_2_client_1
+    cluster: cluster_2
+
+routes:
+  - upstream_client: cl_1_client_1
+    downstream_client: cl_1_client_1
+    upstream_topics:
+      - 'topic1'
+    downstream_topic: 'topic2'
+    repartitioning_strategy: random # strict_p2p | random
+    upstream_group_id: group_22
+    progress_every_secs: 10
+
+  - upstream_client: cl_1_client_1
+    downstream_client: cl_2_client_1
+    upstream_topics:
+      - 'topic2'
+    downstream_topic: 'topic2'
+    repartitioning_strategy: random # strict_p2p | random
+    upstream_group_id: group_22
+    progress_every_secs: 10
+
+  - upstream_client: cl_2_client_1
+    downstream_client: cl_1_client_1
+    upstream_topics:
+      - 'topic2'
+    downstream_topic: 'topic3'
+    repartitioning_strategy: strict_p2p # strict_p2p | random
+    default_begin_offset: earliest # optional
+    upstream_group_id: group_2
+    progress_every_secs: 10
+
+
+watch:
+  - client: cl_1_client_1
+    topic: 'topic1'
+
+  - client: cl_2_client_1
+    topic: 'topic2'
