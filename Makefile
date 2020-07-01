@@ -14,7 +14,8 @@ up:
 	docker-compose -f docker-compose.yml up --rm
 
 test:
-	RUST_LOG="librdkafka=trace,rdkafka::client=debug" cargo test -- --nocapture
+	RUST_LOG="debug" cargo test -- --nocapture
+	# RUST_LOG="librdkafka=trace,rdkafka::client=debug;replicator=debug" cargo test -- --nocapture
 
 
 kafkacat:

@@ -108,12 +108,22 @@ routes:
     default_begin_offset: earliest # optional
     upstream_group_id: group_2
 
-watch:
+watchers:
   - client: cl_1_client_1
-    topic: 'topic1'
+
+    topics:
+      - 'topic1'
+      - 'topic2'
+    fetch_timeout_secs: 20
 
   - client: cl_2_client_1
-    topic: 'topic2'
+    topic: 'topic3'
+    topics:
+      - 'topic2'
+
+  - client: cl_1_client_1
+    topic: 'topic1'
+    topics: []
 
 "#;
 
@@ -150,13 +160,31 @@ async fn main() {
 
     let config: ClientConfig = repl_config.create_client_config("cl_1_client_1", None);
 
+    dbg!(&repl_config);
+
     let replication_rule = repl_config.get_route_clients(0);
     replication_rule.start().await;
 }
 
+
 // #[test]
-#[tokio::test]
-async fn test_upstream_client_create() {
-    dbg!(main().await);
-    // main().await;
+// #[tokio::test]
+// async fn test_upstream_client_create() {
+//     dbg!(main().await);
+//     // main().await;
+// }
+
+
+// #[test]
+#[test]
+fn test_watchers() {
+    env_logger::init();
+
+    let repl_config: config::Config = serde_yaml::from_str(CONFIG_CONTENT).unwrap();
+
+    // dbg!(&repl_config);
+
+    for watcher in repl_config.get_watchers() {
+        watcher.start();
+    }
 }

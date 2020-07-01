@@ -31,8 +31,6 @@ pub struct CommandLine {
     #[structopt(long)]
     pub validate: bool,
 
-    #[structopt(long)]
-    pub watch: bool,
 }
 
 pub fn parse_args() -> CommandLine {

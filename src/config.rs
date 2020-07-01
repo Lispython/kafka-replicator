@@ -1,6 +1,15 @@
+use std::convert::From;
+use std::fmt;
+use std::thread;
+use std::process;
+
+
+use std::fmt::{ Debug, Display};
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    collections::HashSet,
     error::Error,
     marker::Copy,
     time::{Duration, SystemTime},
@@ -44,6 +53,9 @@ use std::iter::Iterator;
 // }
 
 const NANOS_PER_MICRO: u128 = 1_000;
+const DEFAULT_MEDATADA_FETCH_TIMEOUT: u64 = 5;
+const DEFAULT_SHOW_PROGRESS_EVERY_SECS: u64 = 60;
+const DEFAULT_CONFIG_MESSAGE_TIMEOUT: &str = "5000";
 
 pub struct ConsumerTestContext {
     pub _n: i64, // Add data for memory access validation
@@ -111,7 +123,9 @@ pub struct Config {
     pub clusters: Vec<Cluster>,
     pub clients: Vec<Client>,
     pub routes: Vec<Route>,
+    pub watchers: Vec<WatcherConfig>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Client {
@@ -138,6 +152,16 @@ enum RepartitioningStrategy {
     StrictP2P,
     #[serde(rename(deserialize = "random"))]
     Random,
+}
+
+impl fmt::Display for RepartitioningStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:}", if let RepartitioningStrategy::StrictP2P = &self {
+            "strict_p2p"
+        } else {
+            "random"
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone)]
@@ -172,23 +196,110 @@ pub struct ReplicationRule {
     downstream_client: FutureProducer<DefaultClientContext>,
     upstream_client_name: String,
     downstream_client_name: String,
-    show_progress_every_secs: Option<u64>, // repartitioning_strategy: RepartitioningStrategy
+    show_progress_every_secs: Option<u64>,
+    repartitioning_strategy: RepartitioningStrategy
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WatcherConfig {
+    client: String,
+    topics: Vec<String>,
+    show_progress_every_secs: Option<u64>,
+    fetch_timeout_secs: Option<u64>,
+    name: Option<String>
+}
+
+
+
+pub struct Watcher {
+    client: StreamConsumer,
+    topics: Vec<String>,
+    topics_set: HashSet<String>,
+    show_progress_every_secs: Option<u64>,
+    fetch_timeout_secs: Option<u64>,
+    name: String
+}
+
+impl fmt::Debug for Watcher {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Watcher {{ topics: {:} }}", &self.topics.join(", "))
+    }
+}
+
+
+impl Watcher {
+
+    pub fn start(&self) {
+        if self.topics.len() > 0 {
+            info!("Starting {:} for topics \"{:}\"", self.name, self.topics.join(", "));
+        }
+        else {
+            info!("Starting {:} all broker topics", self.name);
+        };
+
+        let timeout: Duration =  Duration::from_secs(self.fetch_timeout_secs.unwrap_or(DEFAULT_MEDATADA_FETCH_TIMEOUT));
+
+        let topic: Option<&str> =  if self.topics.len() == 1 {
+            Some(&self.topics[0])
+        } else {
+            None
+        };
+
+        let progress_timeout = Duration::from_secs(self.show_progress_every_secs.unwrap_or(DEFAULT_SHOW_PROGRESS_EVERY_SECS));
+
+        loop {
+            self.print_current_status(topic.clone(), timeout.clone());
+
+            thread::sleep(progress_timeout);
+        }
+
+    }
+    pub fn print_current_status(&self, topic: Option<&str>, timeout: Duration){
+        let metadata = self.client
+            .fetch_metadata(topic, timeout)
+            .expect("Failed to fetch metadata");
+
+        for topic in metadata.topics().iter(){
+            if self.topics_set.contains(topic.name()) || self.topics_set.len() == 0{
+
+                let mut message_count = 0;
+                for partition in topic.partitions(){
+
+                    let (low, high) = self.client
+                        .fetch_watermarks(topic.name(), partition.id(), Duration::from_secs(1))
+                        .unwrap_or((-1, -1));
+
+                    message_count += high - low;
+
+                }
+
+                info!("\"{:}\" messages status for topic \"{:}\": {:}", self.name, topic.name(), message_count);
+            }
+        };
+    }
 }
 
 impl ReplicationRule {
     pub async fn start(&self) {
+
+        let repartitioning_strategy = if let RepartitioningStrategy::StrictP2P = &self.repartitioning_strategy {
+            true
+        } else {
+            false
+        };
+
         info!(
-            "Starting replication {:} [ {:} ] -> {:} [ {:} ]",
+            "Starting replication {:} [ {:} ] -> {:} [ {:} ] strategy={:}",
             &self.upstream_client_name,
             &self.upstream_topics.join(","),
             &self.downstream_client_name,
-            &self.downstream_topic
+            &self.downstream_topic,
+            &self.repartitioning_strategy
         );
 
         let topics: &Vec<&str> = &self.upstream_topics.iter().map(|x| &**x).collect();
 
-        &self
-            .upstream_client
+        &self.upstream_client
             .subscribe(topics)
             .expect("Can't subscribe to specified topics");
 
@@ -262,9 +373,9 @@ impl ReplicationRule {
                         record = record.headers(new_headers);
                     };
 
-                    // if &self.repartitioning_strategy == RepartitioningStrategy.StrictP2P {
-                    //     record = record.partition(&unwraped_message.partition())
-                    // }
+                    if repartitioning_strategy == true {
+                        record = record.partition(unwraped_message.partition());
+                    }
 
                     &self.downstream_client.send(record, 0);
 
@@ -318,8 +429,6 @@ impl Config {
     }
 
     pub fn create_client_config(&self, name: &str, group_id: Option<&str>) -> ClientConfig {
-        debug!("Create common kafka client");
-
         let client = self.get_client(&name).unwrap();
         let cluster = self.get_cluster(&client.cluster).unwrap();
 
@@ -332,7 +441,7 @@ impl Config {
         );
         config
             .set("bootstrap.servers", &cluster.hosts.join(","))
-            .set("message.timeout.ms", "5000");
+            .set("message.timeout.ms", DEFAULT_CONFIG_MESSAGE_TIMEOUT);
 
         if let Some(v) = group_id {
             info!("Configure client \"{:}\" group: {:}", &name, v);
@@ -341,13 +450,50 @@ impl Config {
 
         for (key, value) in &client.config {
             info!(
-                "Configure client \" {:}\" option: {:}={:}",
+                "Configure client \"{:}\" option: {:}={:}",
                 &name, &key, &value
             );
             config.set(key, value);
         }
 
         config
+    }
+
+    pub fn check_partitions(&self, upstream_config: &ClientConfig, downstream_config: &ClientConfig,
+                            upstream_topics: HashSet<String>, downstream_topic: String) -> Result<(), String>{
+
+        let upstream_consumer: StreamConsumer = upstream_config.create().expect("Can't create consumer.");
+
+        let downstream_consumer: StreamConsumer = downstream_config.create().expect("Can't create consumer.");
+
+
+        let downstream_metadata = downstream_consumer.fetch_metadata(Some(&downstream_topic), Duration::from_secs(10)).expect("Failed to fetch metadata");
+        let upstream_metadata = upstream_consumer.fetch_metadata(None, Duration::from_secs(10)).expect("Failed to fetch metadata");
+
+        let md_downstream_topic_size = downstream_metadata.topics().iter()
+            .filter(|topic| {topic.name() == downstream_topic})
+            .map(|topic| {
+                // (topic.name(), topic.partitions().len())
+                topic.partitions().len()
+            }).next().expect(&format!("Not found topic: {:}", &downstream_topic));
+
+
+        let md_upstream_topics = upstream_metadata.topics()
+            .iter()
+            .filter(|topic| {upstream_topics.contains(topic.name())})
+            .map(|topic| {
+                (topic.name(), topic.partitions().len())});
+
+        for (name, size) in md_upstream_topics {
+            if size != md_downstream_topic_size {
+                return Result::Err(format!("Upstream ({:}) and downstream ({:}) topics have different number of partitions.", name, downstream_topic));
+                //error!("Upstream and downstream topics have different number of partitions.");
+                //process::abort();
+            }
+        }
+
+
+        Ok(())
     }
 
     pub fn get_route_clients(&self, index: usize) -> ReplicationRule {
@@ -359,6 +505,15 @@ impl Config {
             self.create_client_config(&route.upstream_client, group_id);
         let downstream_config: ClientConfig =
             self.create_client_config(&route.downstream_client, Option::None);
+
+        match route.repartitioning_strategy {
+            RepartitioningStrategy::StrictP2P => {
+                self.check_partitions(&upstream_config, &downstream_config,
+                                      route.upstream_topics.clone().iter().cloned().collect(),
+                                      route.downstream_topic.clone()).expect("Upstream and downstream topics have different number of partitions");
+            },
+            _=> {}
+        };
 
         let mut upstream_client = upstream_config;
         let downstream_client = downstream_config;
@@ -374,6 +529,7 @@ impl Config {
         };
 
         ReplicationRule {
+            repartitioning_strategy: route.repartitioning_strategy,
             show_progress_every_secs: route.progress_every_secs.clone(),
             upstream_client_name: route.upstream_client.clone(),
             downstream_client_name: route.downstream_client.clone(),
@@ -394,6 +550,29 @@ impl Config {
             .map(|(pos, _)| self.get_route_clients(pos))
             .collect();
         rules
+    }
+
+    pub fn get_watchers(&self) -> Vec<Watcher> {
+
+        let watchers: Vec<_> = self.watchers.iter().enumerate().map(|(i, x)| {
+            let client: ClientConfig = self.create_client_config(&x.client, None);
+
+            Watcher {
+                client: client.create().expect("Can't create consumer"),
+                topics: x.topics.clone(),
+                topics_set: x.topics.iter().cloned().collect(),
+                show_progress_every_secs: x.show_progress_every_secs.clone(),
+                fetch_timeout_secs: x.fetch_timeout_secs.clone(),
+                name: if let Some(v) = &x.name {
+                    v.clone()
+                }
+                else {
+                    format!("Observer #{:}", i)
+                }
+            }
+        }).collect();
+
+        watchers
     }
 }
 
