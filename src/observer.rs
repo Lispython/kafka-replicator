@@ -12,8 +12,7 @@ use rdkafka::{
 };
 
 use std::{
-    collections::HashMap,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     marker::Copy,
     time::{Duration, SystemTime},
@@ -28,7 +27,7 @@ use replicator::*;
 #[structopt(version = "get_crate_version()")]
 #[structopt(name = "producer")]
 /// Commands help
-pub struct WatcherCommandLine {
+pub struct ObserverCommandLine {
     #[structopt(parse(from_os_str), name = "CONFIG")]
     pub input: PathBuf,
 
@@ -39,34 +38,29 @@ pub struct WatcherCommandLine {
     pub num: u64,
 }
 
-pub fn parse_args() -> WatcherCommandLine {
-    WatcherCommandLine::from_args()
+pub fn parse_args() -> ObserverCommandLine {
+    ObserverCommandLine::from_args()
 }
-
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    info!("Kafka topic watcher");
+    info!("Kafka topic observer");
 
-    let opt: WatcherCommandLine = parse_args();
+    let opt: ObserverCommandLine = parse_args();
 
     let config = match utils::get_config(&opt.input) {
         Ok(value) => value,
         _ => panic!("Invalid config file: {:?}", &opt.input),
     };
 
-    let mut watchers = vec![];
+    let mut observers = vec![];
 
-    for watcher in config.get_watchers() {
+    for observer in config.get_observers() {
+        observers.push(thread::spawn(move || observer.start()));
+    }
 
-        watchers.push(thread::spawn(move || {
-            watcher.start()
-        }));
-
-    };
-
-    for thread in watchers {
+    for thread in observers {
         thread.join();
     }
 

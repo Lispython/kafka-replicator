@@ -1,8 +1,15 @@
 [package]
-name = "kafka_replicator"
-version = "0.1.0"
+name = "kafka-replicator"
+version = "0.4.0"
 authors = ["Alex"]
 edition = "2018"
+description = "Application for replication data between kafka clusters."
+readme = "README.rst"
+repository = "https://github.com/lispython/kafka-replicator/"
+license-file = "LICENSE"
+keywords = ["kafka", "replication", "observer"]
+categories = ["command-line-utilities"]
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -21,6 +28,8 @@ rdkafka-sys = "1.3.1"
 rdkafka = { version = "0.23.1", features = ["ssl", "sasl"]}
 env_logger = "0.7.1"
 futures = "0.3.0"
+byte-unit = "4.0.6"
+pretty-bytes = "0.2.2"
 
 
 [profile.dev]
@@ -35,14 +44,14 @@ name = "replicator"
 path = "src/lib.rs"
 
 [[bin]]
-name = "replicator"
+name = "kafka-replicator"
 path = "src/main.rs"
 
 
 [[bin]]
-name = "producer"
+name = "kafka-producer"
 path = "src/producer.rs"
 
 [[bin]]
-name = "watcher"
-path = "src/watcher.rs"
+name = "kafka-observer"
+path = "src/observer.rs"

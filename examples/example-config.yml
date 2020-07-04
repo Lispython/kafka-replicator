@@ -51,7 +51,7 @@ routes:
     progress_every_secs: 10
 
 
-watchers:
+observers:
   - client: cl_1_client_1
     name: "my name"
     topics:
@@ -64,6 +64,8 @@ watchers:
     topic: 'topic3'
     topics:
       - 'topic2'
+    show_progress_every_secs: 5
+
 
   - client: cl_1_client_1
     topic: 'topic1'

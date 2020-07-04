@@ -9,7 +9,11 @@ use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     util::Timeout,
 };
-use std::path::PathBuf;
+
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime},
+};
 use structopt::StructOpt;
 
 use replicator::*;
@@ -36,6 +40,9 @@ pub struct ProducerCommandLine {
 
     #[structopt(long = "num", default_value = "5")]
     pub num: u64,
+
+    #[structopt(long = "status-every", default_value = "10000")]
+    pub status_every_n_records: u64,
 }
 
 pub fn parse_args() -> ProducerCommandLine {
@@ -60,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create()
         .expect("Can't create producer.");
 
+    let start_time = Instant::now();
     for x in 0..opt.num {
         let payload = utils::rand_string("payload_", Some(10));
         let key = utils::rand_string("key_", None);
@@ -76,10 +84,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         //                                                 "header_value"));
 
         producer.send(record, 0);
+
+        if x % opt.status_every_n_records == 0 {
+            info!(
+                "Produced {:} messages to topic {:} within {:?}",
+                x,
+                opt.topic,
+                Instant::now().duration_since(start_time)
+            );
+        };
+
         // let mut rt = tokio::runtime::Runtime::new().unwrap();
     }
     producer.flush(Timeout::Never);
 
-    info!("Produced {:} messages to topic {:}", opt.num, opt.topic);
+    info!(
+        "Produced {:} messages to topic {:} within {:?}",
+        opt.num,
+        opt.topic,
+        Instant::now().duration_since(start_time)
+    );
     Ok(())
 }

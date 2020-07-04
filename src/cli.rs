@@ -30,7 +30,6 @@ pub struct CommandLine {
 
     #[structopt(long)]
     pub validate: bool,
-
 }
 
 pub fn parse_args() -> CommandLine {

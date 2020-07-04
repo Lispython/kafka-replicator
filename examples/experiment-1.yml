@@ -1,0 +1,42 @@
+clusters:
+  - name: cluster_1
+    hosts:
+      - replicator-kafka-1:9092
+      - replicator-kafka-1:9092
+      - kafka_replicator_replicator_kafka_1_1:9092
+  - name: cluster_2
+    hosts:
+      - kafka_replicator_replicator_kafka_2_1:9092
+      - replicator-kafka-2:9092
+
+clients:
+  - client: cl_1_client_1
+    cluster: cluster_1
+    config: # optional
+       message.timeout.ms: 5000
+       auto.offset.reset: earliest
+  - client: cl_2_client_1
+    cluster: cluster_2
+
+routes:
+  - upstream_client: cl_1_client_1
+    downstream_client: cl_1_client_1
+    upstream_topics:
+      - 'experimental_topic_1'
+    downstream_topic: 'experimental_topic_2_output'
+    repartitioning_strategy: strict_p2p # strict_p2p | random
+    upstream_group_id: group1
+    progress_every_secs: 5
+    limits:
+      messages_per_sec: 10000
+      number_of_messages:
+
+
+observers:
+  - client: cl_1_client_1
+    name: "Experiment observer"
+    topics:
+      - 'experimental_topic_1'
+      - 'experimental_topic_2_output'
+    fetch_timeout_secs: 5
+    show_progress_every_secs: 10

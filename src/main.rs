@@ -8,7 +8,7 @@ extern crate log;
 use replicator::*;
 
 async fn run_replicator(config: config::Config) -> Result<(), Box<dyn std::error::Error>> {
-    for route_rule in config.get_routes() {
+    for mut route_rule in config.get_routes() {
         tokio::spawn(async move { route_rule.start().await });
     }
     tokio::signal::ctrl_c().await?;

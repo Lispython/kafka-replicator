@@ -1,18 +1,13 @@
-use std::convert::From;
-use std::fmt;
-use std::thread;
-use std::process;
+use std::{convert::From, fmt, process, thread};
 
-
-use std::fmt::{ Debug, Display};
+use std::fmt::{Debug, Display};
 
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     marker::Copy,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use rdkafka::{
@@ -42,6 +37,7 @@ use std::{
     },
 };
 
+use byte_unit::Byte;
 use std::iter::Iterator;
 
 // pub struct ProducerContext {
@@ -123,9 +119,8 @@ pub struct Config {
     pub clusters: Vec<Cluster>,
     pub clients: Vec<Client>,
     pub routes: Vec<Route>,
-    pub watchers: Vec<WatcherConfig>,
+    pub observers: Vec<ObserverConfig>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Client {
@@ -156,11 +151,15 @@ enum RepartitioningStrategy {
 
 impl fmt::Display for RepartitioningStrategy {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:}", if let RepartitioningStrategy::StrictP2P = &self {
-            "strict_p2p"
-        } else {
-            "random"
-        })
+        write!(
+            f,
+            "{:}",
+            if let RepartitioningStrategy::StrictP2P = &self {
+                "strict_p2p"
+            } else {
+                "random"
+            }
+        )
     }
 }
 
@@ -189,7 +188,34 @@ pub struct Route {
     progress_every_secs: Option<u64>,
 }
 
-pub struct ReplicationRule {
+// TODO: realize default trait
+pub struct PipelineStats {
+    start_time: SystemTime,
+    received: u64,
+    replicated: u64,
+    cumulative_duration: u64,
+    // number_of_bytes: u64,
+    keys_bytes: u64,
+    payload_bytes: u64,
+    headers_bytes: u64,
+}
+
+impl fmt::Display for PipelineStats {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Stats( messages={:} dur={:?}/{:.3?} volume={:} rate={:}/sec )",
+            self.replicated,
+            self.get_avg_duration(),
+            Duration::from_nanos(self.cumulative_duration),
+            Byte::from_bytes(self.get_bytes_size() as u128).get_appropriate_unit(true),
+            Byte::from_bytes(self.get_data_rate() as u128).get_appropriate_unit(true)
+        )
+    }
+}
+
+pub struct Pipeline {
+    id: u64,
     downstream_topic: String,
     upstream_topics: Vec<String>,
     upstream_client: StreamConsumer,
@@ -197,97 +223,150 @@ pub struct ReplicationRule {
     upstream_client_name: String,
     downstream_client_name: String,
     show_progress_every_secs: Option<u64>,
-    repartitioning_strategy: RepartitioningStrategy
+    repartitioning_strategy: RepartitioningStrategy,
+    stats: PipelineStats,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct WatcherConfig {
+pub struct ObserverConfig {
     client: String,
     topics: Vec<String>,
     show_progress_every_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
-    name: Option<String>
+    name: Option<String>,
 }
 
-
-
-pub struct Watcher {
+pub struct Observer {
     client: StreamConsumer,
     topics: Vec<String>,
     topics_set: HashSet<String>,
     show_progress_every_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
-    name: String
+    name: String,
 }
 
-impl fmt::Debug for Watcher {
+impl fmt::Debug for Observer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Watcher {{ topics: {:} }}", &self.topics.join(", "))
+        write!(f, "Observer {{ topics: {:} }}", &self.topics.join(", "))
     }
 }
 
+impl PipelineStats {
+    pub fn new() -> Self {
+        PipelineStats {
+            received: 0,
+            replicated: 0,
+            cumulative_duration: 0,
+            start_time: SystemTime::now(),
 
-impl Watcher {
+            keys_bytes: 0,
+            payload_bytes: 0,
+            headers_bytes: 0,
+        }
+    }
 
+    pub fn increase_replicated(&mut self) {
+        self.replicated += 1;
+    }
+
+    pub fn update_bytes(&mut self, keys: usize, payload: usize, headers: usize) {
+        self.keys_bytes += keys as u64;
+        self.payload_bytes += payload as u64;
+        self.headers_bytes += headers as u64;
+    }
+
+    pub fn update_cumulative(&mut self, value: Duration) {
+        self.cumulative_duration += value.as_nanos() as u64;
+    }
+
+    pub fn get_avg_duration(&self) -> Duration {
+        let duration = if self.replicated > 0 {
+            self.cumulative_duration / self.replicated as u64
+        } else {
+            0
+        };
+
+        return Duration::from_nanos(duration);
+    }
+
+    pub fn get_bytes_size(&self) -> u64 {
+        self.keys_bytes + self.payload_bytes + self.headers_bytes
+    }
+
+    pub fn get_data_rate(&self) -> u64 {
+        if Duration::from_nanos(self.cumulative_duration).as_secs() > 0 {
+            self.get_bytes_size() / Duration::from_nanos(self.cumulative_duration).as_secs()
+        } else {
+            0
+        }
+    }
+}
+
+impl Observer {
     pub fn start(&self) {
         if self.topics.len() > 0 {
-            info!("Starting {:} for topics \"{:}\"", self.name, self.topics.join(", "));
-        }
-        else {
+            info!(
+                "Starting {:} for topics \"{:}\"",
+                self.name,
+                self.topics.join(", ")
+            );
+        } else {
             info!("Starting {:} all broker topics", self.name);
         };
 
-        let timeout: Duration =  Duration::from_secs(self.fetch_timeout_secs.unwrap_or(DEFAULT_MEDATADA_FETCH_TIMEOUT));
+        let timeout: Duration = Duration::from_secs(
+            self.fetch_timeout_secs
+                .unwrap_or(DEFAULT_MEDATADA_FETCH_TIMEOUT),
+        );
 
-        let topic: Option<&str> =  if self.topics.len() == 1 {
+        let topic: Option<&str> = if self.topics.len() == 1 {
             Some(&self.topics[0])
         } else {
             None
         };
 
-        let progress_timeout = Duration::from_secs(self.show_progress_every_secs.unwrap_or(DEFAULT_SHOW_PROGRESS_EVERY_SECS));
+        let progress_timeout = Duration::from_secs(
+            self.show_progress_every_secs
+                .unwrap_or(DEFAULT_SHOW_PROGRESS_EVERY_SECS),
+        );
 
         loop {
             self.print_current_status(topic.clone(), timeout.clone());
 
             thread::sleep(progress_timeout);
         }
-
     }
-    pub fn print_current_status(&self, topic: Option<&str>, timeout: Duration){
-        let metadata = self.client
+    pub fn print_current_status(&self, topic: Option<&str>, timeout: Duration) {
+        let metadata = self
+            .client
             .fetch_metadata(topic, timeout)
             .expect("Failed to fetch metadata");
 
-        for topic in metadata.topics().iter(){
-            if self.topics_set.contains(topic.name()) || self.topics_set.len() == 0{
-
+        for topic in metadata.topics().iter() {
+            if self.topics_set.contains(topic.name()) || self.topics_set.len() == 0 {
                 let mut message_count = 0;
-                for partition in topic.partitions(){
-
-                    let (low, high) = self.client
+                for partition in topic.partitions() {
+                    let (low, high) = self
+                        .client
                         .fetch_watermarks(topic.name(), partition.id(), Duration::from_secs(1))
                         .unwrap_or((-1, -1));
 
                     message_count += high - low;
-
                 }
 
-                info!("\"{:}\" messages status for topic \"{:}\": {:}", self.name, topic.name(), message_count);
+                info!(
+                    "\"{:}\" messages status for topic \"{:}\": {:}",
+                    self.name,
+                    topic.name(),
+                    message_count
+                );
             }
-        };
+        }
     }
 }
 
-impl ReplicationRule {
-    pub async fn start(&self) {
-
-        let repartitioning_strategy = if let RepartitioningStrategy::StrictP2P = &self.repartitioning_strategy {
-            true
-        } else {
-            false
-        };
-
+impl Pipeline {
+    pub async fn start(&mut self) {
         info!(
             "Starting replication {:} [ {:} ] -> {:} [ {:} ] strategy={:}",
             &self.upstream_client_name,
@@ -299,40 +378,35 @@ impl ReplicationRule {
 
         let topics: &Vec<&str> = &self.upstream_topics.iter().map(|x| &**x).collect();
 
-        &self.upstream_client
+        &self
+            .upstream_client
             .subscribe(topics)
             .expect("Can't subscribe to specified topics");
 
         let mut stream = (&self.upstream_client).start_with(Duration::from_millis(100), true);
 
-        let mut received: u64 = 0;
-        let mut replicated: u64 = 0;
-        let mut cumulative_duration: u64 = 0;
-        let mut avg_duration: u64 = 0;
-        let mut last_info_time = SystemTime::now();
+        let mut last_info_time = Instant::now();
 
         let progress_every_secs = self.show_progress_every_secs.unwrap_or(0);
 
         while let Some(message) = stream.next().await {
-            let difference = SystemTime::now()
-                .duration_since(last_info_time)
-                .expect("Clock may have gone backwards");
+            let difference = Instant::now().duration_since(last_info_time);
 
             if progress_every_secs > 0 && difference.as_secs() > progress_every_secs {
-                if replicated > 0 {
-                    avg_duration = cumulative_duration / replicated;
-                }
+                last_info_time = Instant::now();
 
-                last_info_time = SystemTime::now();
-
-                debug!("Current progress for {:} [{:}] -> {:} [{:}]: received={:} replicated={:} avg_duration={:?}",
-                       &self.upstream_client_name,
-                       &self.upstream_topics.join(","),
-                       &self.downstream_client_name,
-                       &self.downstream_topic,
-                       &received,
-                       &replicated,
-                       Duration::from_nanos(avg_duration as u64))
+                debug!(
+                    "Pipeline {:} status {:} [{:}] -> {:} [{:}]: {:}",
+                    self.id,
+                    self.upstream_client_name,
+                    self.upstream_topics.join(","),
+                    self.downstream_client_name,
+                    self.downstream_topic,
+                    self.stats,
+                    // &received,
+                    // &replicated,
+                    // Duration::from_nanos(avg_duration as u64)
+                )
             };
 
             match message {
@@ -340,9 +414,8 @@ impl ReplicationRule {
                     // println!(">>>>> {:}", e);
                 }
                 Ok(message_content) => {
-                    let received_time = SystemTime::now();
+                    let received_time = Instant::now();
 
-                    received += 1;
                     let unwraped_message = &message_content;
 
                     let input_payload = &unwraped_message.payload();
@@ -357,8 +430,10 @@ impl ReplicationRule {
                     };
 
                     if (&input_key).is_some() == true {
-                        record = record.key(&input_key.unwrap())
+                        record = record.key(&input_key.unwrap());
                     };
+
+                    let mut headers_len = 0;
 
                     // TODO: maybe try convert BorrowedHeaders ?
                     if input_headers.is_some() == true {
@@ -368,24 +443,29 @@ impl ReplicationRule {
                             let header = input_headers.unwrap().get(i);
                             if let Some((key, value)) = header {
                                 new_headers = new_headers.add(key, value);
+                                headers_len += key.len() + value.len();
                             }
                         }
                         record = record.headers(new_headers);
                     };
 
-                    if repartitioning_strategy == true {
+                    if let RepartitioningStrategy::StrictP2P = &self.repartitioning_strategy {
                         record = record.partition(unwraped_message.partition());
                     }
 
                     &self.downstream_client.send(record, 0);
 
-                    replicated += 1;
+                    self.stats.increase_replicated();
+                    self.stats.update_bytes(
+                        unwraped_message.key_len(),
+                        unwraped_message.payload_len(),
+                        headers_len,
+                    );
 
-                    let duration = SystemTime::now()
-                        .duration_since(received_time)
-                        .expect("Clock may have gone backwards");
+                    // dbg!((SystemTime::now(), &received_time));
+                    let duration = Instant::now().duration_since(received_time);
 
-                    cumulative_duration += duration.as_nanos() as u64;
+                    self.stats.update_cumulative(duration);
                 }
             }
 
@@ -459,30 +539,42 @@ impl Config {
         config
     }
 
-    pub fn check_partitions(&self, upstream_config: &ClientConfig, downstream_config: &ClientConfig,
-                            upstream_topics: HashSet<String>, downstream_topic: String) -> Result<(), String>{
+    pub fn check_partitions(
+        &self,
+        upstream_config: &ClientConfig,
+        downstream_config: &ClientConfig,
+        upstream_topics: HashSet<String>,
+        downstream_topic: String,
+    ) -> Result<(), String> {
+        let upstream_consumer: StreamConsumer =
+            upstream_config.create().expect("Can't create consumer.");
 
-        let upstream_consumer: StreamConsumer = upstream_config.create().expect("Can't create consumer.");
+        let downstream_consumer: StreamConsumer =
+            downstream_config.create().expect("Can't create consumer.");
 
-        let downstream_consumer: StreamConsumer = downstream_config.create().expect("Can't create consumer.");
+        let downstream_metadata = downstream_consumer
+            .fetch_metadata(Some(&downstream_topic), Duration::from_secs(10))
+            .expect("Failed to fetch metadata");
+        let upstream_metadata = upstream_consumer
+            .fetch_metadata(None, Duration::from_secs(10))
+            .expect("Failed to fetch metadata");
 
-
-        let downstream_metadata = downstream_consumer.fetch_metadata(Some(&downstream_topic), Duration::from_secs(10)).expect("Failed to fetch metadata");
-        let upstream_metadata = upstream_consumer.fetch_metadata(None, Duration::from_secs(10)).expect("Failed to fetch metadata");
-
-        let md_downstream_topic_size = downstream_metadata.topics().iter()
-            .filter(|topic| {topic.name() == downstream_topic})
+        let md_downstream_topic_size = downstream_metadata
+            .topics()
+            .iter()
+            .filter(|topic| topic.name() == downstream_topic)
             .map(|topic| {
                 // (topic.name(), topic.partitions().len())
                 topic.partitions().len()
-            }).next().expect(&format!("Not found topic: {:}", &downstream_topic));
+            })
+            .next()
+            .expect(&format!("Not found topic: {:}", &downstream_topic));
 
-
-        let md_upstream_topics = upstream_metadata.topics()
+        let md_upstream_topics = upstream_metadata
+            .topics()
             .iter()
-            .filter(|topic| {upstream_topics.contains(topic.name())})
-            .map(|topic| {
-                (topic.name(), topic.partitions().len())});
+            .filter(|topic| upstream_topics.contains(topic.name()))
+            .map(|topic| (topic.name(), topic.partitions().len()));
 
         for (name, size) in md_upstream_topics {
             if size != md_downstream_topic_size {
@@ -492,11 +584,10 @@ impl Config {
             }
         }
 
-
         Ok(())
     }
 
-    pub fn get_route_clients(&self, index: usize) -> ReplicationRule {
+    pub fn get_route_clients(&self, index: usize) -> Pipeline {
         let route = &self.routes[index];
 
         let group_id: Option<&str> = (&route.upstream_group_id).as_deref();
@@ -508,11 +599,15 @@ impl Config {
 
         match route.repartitioning_strategy {
             RepartitioningStrategy::StrictP2P => {
-                self.check_partitions(&upstream_config, &downstream_config,
-                                      route.upstream_topics.clone().iter().cloned().collect(),
-                                      route.downstream_topic.clone()).expect("Upstream and downstream topics have different number of partitions");
-            },
-            _=> {}
+                self.check_partitions(
+                    &upstream_config,
+                    &downstream_config,
+                    route.upstream_topics.clone().iter().cloned().collect(),
+                    route.downstream_topic.clone(),
+                )
+                .expect("Upstream and downstream topics have different number of partitions");
+            }
+            _ => {}
         };
 
         let mut upstream_client = upstream_config;
@@ -528,7 +623,8 @@ impl Config {
             _ => {}
         };
 
-        ReplicationRule {
+        Pipeline {
+            id: index as u64,
             repartitioning_strategy: route.repartitioning_strategy,
             show_progress_every_secs: route.progress_every_secs.clone(),
             upstream_client_name: route.upstream_client.clone(),
@@ -539,10 +635,12 @@ impl Config {
             downstream_client: downstream_client
                 .create()
                 .expect("Failed to create producer"), // repartitioning_strategy: route.repartitioning_strategy.copy()
+
+            stats: PipelineStats::new(),
         }
     }
 
-    pub fn get_routes(&self) -> Vec<ReplicationRule> {
+    pub fn get_routes(&self) -> Vec<Pipeline> {
         let rules: Vec<_> = self
             .routes
             .iter()
@@ -552,27 +650,30 @@ impl Config {
         rules
     }
 
-    pub fn get_watchers(&self) -> Vec<Watcher> {
+    pub fn get_observers(&self) -> Vec<Observer> {
+        let observers: Vec<_> = self
+            .observers
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let client: ClientConfig = self.create_client_config(&x.client, None);
 
-        let watchers: Vec<_> = self.watchers.iter().enumerate().map(|(i, x)| {
-            let client: ClientConfig = self.create_client_config(&x.client, None);
-
-            Watcher {
-                client: client.create().expect("Can't create consumer"),
-                topics: x.topics.clone(),
-                topics_set: x.topics.iter().cloned().collect(),
-                show_progress_every_secs: x.show_progress_every_secs.clone(),
-                fetch_timeout_secs: x.fetch_timeout_secs.clone(),
-                name: if let Some(v) = &x.name {
-                    v.clone()
+                Observer {
+                    client: client.create().expect("Can't create consumer"),
+                    topics: x.topics.clone(),
+                    topics_set: x.topics.iter().cloned().collect(),
+                    show_progress_every_secs: x.show_progress_every_secs.clone(),
+                    fetch_timeout_secs: x.fetch_timeout_secs.clone(),
+                    name: if let Some(v) = &x.name {
+                        v.clone()
+                    } else {
+                        format!("Observer #{:}", i)
+                    },
                 }
-                else {
-                    format!("Observer #{:}", i)
-                }
-            }
-        }).collect();
+            })
+            .collect();
 
-        watchers
+        observers
     }
 }
 
