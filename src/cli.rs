@@ -10,8 +10,8 @@ pub fn get_crate_version() -> &'static str {
 }
 
 #[derive(StructOpt, Debug)]
-#[structopt(version = "get_crate_version()")]
-#[structopt(name = "redirector")]
+#[structopt(version = get_crate_version())]
+#[structopt(name = "Kafka topics replicator")]
 /// Commands help
 pub struct CommandLine {
     // /// Files to process

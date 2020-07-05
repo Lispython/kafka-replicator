@@ -1,6 +1,6 @@
 [package]
 name = "kafka-replicator"
-version = "0.4.0"
+version = "0.4.2"
 authors = ["Alex"]
 edition = "2018"
 description = "Application for replication data between kafka clusters."

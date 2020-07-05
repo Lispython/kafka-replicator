@@ -24,8 +24,8 @@ use structopt::StructOpt;
 use replicator::*;
 
 #[derive(StructOpt, Debug)]
-#[structopt(version = "get_crate_version()")]
-#[structopt(name = "producer")]
+#[structopt(version = get_crate_version())]
+#[structopt(name = "Kafka topics observer")]
 /// Commands help
 pub struct ObserverCommandLine {
     #[structopt(parse(from_os_str), name = "CONFIG")]
