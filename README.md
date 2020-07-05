@@ -15,7 +15,7 @@ Lets start with an overview of features that exist in kafka-replicator:
   * [ ] *Auto-create topics:* Destination topics are automatically created for strict_p2p strategy;
   * [x] *Stats:* The tool shows replication status;
   * [ ] *Monitoring:* Kafka replicator exports stats via prometheus.
-  * [-] *Cycle detection*
+  * [ ] *Cycle detection*
 
 
 
