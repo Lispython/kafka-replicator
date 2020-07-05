@@ -1,6 +1,6 @@
 # Kafka replicator
 
-*Kafka Replicator* is an easy to use tool for copying data between two Apache Kafka clusters with configurable re-partitionning strategy.
+**Kafka Replicator** is an easy to use tool for copying data between two Apache Kafka clusters with configurable re-partitionning strategy.
 
 Data will be read from topics in the origin cluster and written to a topic/topics in the destination cluster according config rules.
 
@@ -9,13 +9,13 @@ Data will be read from topics in the origin cluster and written to a topic/topic
 
 Lets start with an overview of features that exist in kafka-replicator:
 
-  * [x] *Data replication:* Real-time event streaming between Kafka clusters and data centers;
-  * [ ] *Schema replication:* Copy schema from source cluster to destination;
-  * [x] *Flexible topic selection:* Select topics with configurable config;
-  * [ ] *Auto-create topics:* Destination topics are automatically created for strict_p2p strategy;
-  * [x] *Stats:* The tool shows replication status;
-  * [ ] *Monitoring:* Kafka replicator exports stats via prometheus.
-  * [ ] *Cycle detection*
+  * [x] **Data replication:** Real-time event streaming between Kafka clusters and data centers;
+  * [ ] **Schema replication:** Copy schema from source cluster to destination;
+  * [x] **Flexible topic selection:** Select topics with configurable config;
+  * [ ] **Auto-create topics:** Destination topics are automatically created for strict_p2p strategy;
+  * [x] **Stats:** The tool shows replication status;
+  * [ ] **Monitoring:** Kafka replicator exports stats via prometheus.
+  * [ ] **Cycle detection**
 
 
 
