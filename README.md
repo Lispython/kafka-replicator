@@ -105,7 +105,7 @@ routes:
     downstream_topic: 'topic2'
     repartitioning_strategy: random # strict_p2p | random
     upstream_group_id: group_22
-    progress_every_secs: 10
+    show_progress_interval_secs: 10
     limits:
       messages_per_sec: 10000
       number_of_messages:
@@ -117,7 +117,7 @@ routes:
     downstream_topic: 'topic2'
     repartitioning_strategy: strict_p2p
     upstream_group_id: group_22
-    progress_every_secs: 10
+    show_progress_interval_secs: 10
 
   - upstream_client: cl_2_client_1
     downstream_client: cl_1_client_1
@@ -127,7 +127,7 @@ routes:
     repartitioning_strategy: strict_p2p # strict_p2p | random
     default_begin_offset: earliest # optional
     upstream_group_id: group_2
-    progress_every_secs: 10
+    show_progress_interval_secs: 10
 
 
 observers:
@@ -137,13 +137,13 @@ observers:
       - 'topic1'
       - 'topic2'
     fetch_timeout_secs: 5
-    show_progress_every_secs: 10
+    show_progress_interval_secs: 10
 
   - client: cl_2_client_1
     topic: 'topic3'
     topics:
       - 'topic2'
-    show_progress_every_secs: 5
+    show_progress_interval_secs: 5
 
 
   - client: cl_1_client_1

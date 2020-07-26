@@ -39,4 +39,4 @@ observers:
       - 'experimental_topic_1'
       - 'experimental_topic_2_output'
     fetch_timeout_secs: 5
-    show_progress_every_secs: 10
+    show_progress_interval_secs: 10

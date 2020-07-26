@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     marker::Copy,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rdkafka::{
@@ -32,14 +32,16 @@ use futures::{future, stream::StreamExt};
 use std::{
     env::{self, VarError},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicUsize, Ordering, AtomicBool},
+        Arc, Mutex,
     },
 };
 
 use byte_unit::Byte;
 use std::iter::Iterator;
 
+
+use super::metrics;
 // pub struct ProducerContext {
 //     pub some_data: i64, // Add some data so that valgrind can check proper allocation
 // }
@@ -50,8 +52,11 @@ use std::iter::Iterator;
 
 const NANOS_PER_MICRO: u128 = 1_000;
 const DEFAULT_MEDATADA_FETCH_TIMEOUT: u64 = 5;
-const DEFAULT_SHOW_PROGRESS_EVERY_SECS: u64 = 60;
+const DEFAULT_SHOW_PROGRESS_INTERVAL_SECS: u64 = 60;
 const DEFAULT_CONFIG_MESSAGE_TIMEOUT: &str = "5000";
+const DEFAULT_FETCH_INTERVAL_SECS: u64 = 60;
+const LOOP_ITERATION_SLEEP: u64 = 1;
+
 
 pub struct ConsumerTestContext {
     pub _n: i64, // Add data for memory access validation
@@ -120,6 +125,7 @@ pub struct Config {
     pub clients: Vec<Client>,
     pub routes: Vec<Route>,
     pub observers: Vec<ObserverConfig>,
+    pub prometheus: Option<PrometheusConfig>
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -185,7 +191,7 @@ pub struct Route {
     repartitioning_strategy: RepartitioningStrategy,
 
     default_begin_offset: Option<BeginOffset>,
-    progress_every_secs: Option<u64>,
+    show_progress_interval_secs: Option<u64>,
 }
 
 // TODO: realize default trait
@@ -222,27 +228,44 @@ pub struct Pipeline {
     downstream_client: FutureProducer<DefaultClientContext>,
     upstream_client_name: String,
     downstream_client_name: String,
-    show_progress_every_secs: Option<u64>,
+    show_progress_interval_secs: Option<u64>,
     repartitioning_strategy: RepartitioningStrategy,
     stats: PipelineStats,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PrometheusConfig {
+    pub labels: Option<HashMap<String, String>>,
+    pub namespace: Option<String>
+
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ObserverConfig {
     client: String,
     topics: Vec<String>,
-    show_progress_every_secs: Option<u64>,
+    show_progress_interval_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
+    fetch_interval_secs: Option<u64>,
     name: Option<String>,
 }
 
 pub struct Observer {
+    name: String,
     client: StreamConsumer,
     topics: Vec<String>,
     topics_set: HashSet<String>,
-    show_progress_every_secs: Option<u64>,
+    group_id: Option<String>,
+    show_progress_interval_secs: Option<u64>,
+
+    fetch_data_interval_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
-    name: String,
+
+    last_status_time: Instant,
+    last_update_time: Instant,
+    last_results: HashMap<String, i64>,
+
+    metrics: Arc<Mutex<metrics::ObserverMetrics>>,
 }
 
 impl fmt::Debug for Observer {
@@ -303,65 +326,148 @@ impl PipelineStats {
 }
 
 impl Observer {
-    pub fn start(&self) {
-        if self.topics.len() > 0 {
-            info!(
-                "Starting {:} for topics \"{:}\"",
-                self.name,
-                self.topics.join(", ")
-            );
-        } else {
-            info!("Starting {:} all broker topics", self.name);
-        };
 
-        let timeout: Duration = Duration::from_secs(
-            self.fetch_timeout_secs
-                .unwrap_or(DEFAULT_MEDATADA_FETCH_TIMEOUT),
-        );
+    pub fn start(&mut self, is_running: Arc<AtomicBool>) {
+        {
+            if self.topics.len() > 0 {
+                info!(
+                    "Starting {:} for topics \"{:}\"",
+                    self.name,
+                    self.topics.join(", ")
+                );
+            } else {
+                info!("Starting {:} all broker topics", self.name);
+            };
 
-        let topic: Option<&str> = if self.topics.len() == 1 {
-            Some(&self.topics[0])
-        } else {
-            None
-        };
+        }
 
-        let progress_timeout = Duration::from_secs(
-            self.show_progress_every_secs
-                .unwrap_or(DEFAULT_SHOW_PROGRESS_EVERY_SECS),
-        );
+        let loop_sleep = Duration::from_secs(LOOP_ITERATION_SLEEP);
 
         loop {
-            self.print_current_status(topic.clone(), timeout.clone());
-
-            thread::sleep(progress_timeout);
+            if !is_running.load( Ordering::SeqCst){
+                info!("{:} received SIGINT, exiting...", self.name);
+                break
+            }
+            self.update_data_if_need();
+            self.print_status_if_need();
+            thread::sleep(loop_sleep);
         }
     }
-    pub fn print_current_status(&self, topic: Option<&str>, timeout: Duration) {
+
+    pub fn update_data_if_need(&mut self) {
+
+        let difference = Instant::now().duration_since(self.last_update_time);
+
+        if self.get_fetch_interval().as_secs() > 0 && difference > self.get_fetch_interval() {
+            let results = self.update_current_status();
+            self.last_results = results;
+            self.last_update_time = Instant::now();
+        }
+    }
+
+    pub fn print_status_if_need(&mut self) {
+
+        let difference = Instant::now().duration_since(self.last_status_time);
+
+        if self.get_show_progress_interval().as_secs() > 0 && difference > self.get_show_progress_interval() {
+
+            for (name, count) in self.last_results.iter() {
+                 info!("\"{:}\": topic \"{:}\" has {:} message(s)", self.name, name, count);
+            }
+            self.last_status_time = Instant::now();
+        }
+    }
+
+    pub fn get_fetch_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.fetch_timeout_secs
+                .unwrap_or(DEFAULT_MEDATADA_FETCH_TIMEOUT)
+        )
+    }
+
+    pub fn get_show_progress_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.show_progress_interval_secs
+                .unwrap_or(DEFAULT_SHOW_PROGRESS_INTERVAL_SECS)
+        )
+    }
+
+    pub fn get_fetch_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.fetch_data_interval_secs
+                .unwrap_or(DEFAULT_FETCH_INTERVAL_SECS)
+        )
+    }
+
+    pub fn update_current_status(&self) -> HashMap<String, i64> {
+
+        let mut results: HashMap<String, i64> = HashMap::new();
+
+        let topic: Option<&str> =
+            if self.topics.len() == 1 {
+                Some(&self.topics[0])
+            } else {
+                None
+        };
+
         let metadata = self
             .client
-            .fetch_metadata(topic, timeout)
+            .fetch_metadata(topic, self.get_fetch_timeout())
             .expect("Failed to fetch metadata");
 
         for topic in metadata.topics().iter() {
             if self.topics_set.contains(topic.name()) || self.topics_set.len() == 0 {
-                let mut message_count = 0;
+                let mut topic_message_count = 0;
                 for partition in topic.partitions() {
                     let (low, high) = self
                         .client
-                        .fetch_watermarks(topic.name(), partition.id(), Duration::from_secs(1))
+                        .fetch_watermarks(
+                            topic.name(),
+                            partition.id(),
+                            Duration::from_secs(1))
                         .unwrap_or((-1, -1));
 
-                    message_count += high - low;
+                    let partition_message_count = high - low;
+                    topic_message_count += partition_message_count;
+
+                    let labels = [topic.name(), &partition.id().to_string()];
+
+                    match self.metrics.lock() {
+                        Ok(guard) => {
+
+                            guard.partition_start_offset.with_label_values(&labels).set(low);
+
+                            guard.partition_end_offset.with_label_values(&labels).set(high);
+
+                            guard.number_of_records_for_partition.with_label_values(&labels).set(partition_message_count);
+                        },
+                        Err(poisoned) => {
+                            error!("Can't acquire metrics lock for topic={:} and partition={:}", topic.name(), &partition.id());
+                        },
+
+
+                    };
+
                 }
 
-                info!(
-                    "\"{:}\" messages status for topic \"{:}\": {:}",
-                    self.name,
-                    topic.name(),
-                    message_count
-                );
+                results.insert(topic.name().to_string(), topic_message_count);
+
+                match self.metrics.lock() {
+                    Ok(guard) => {
+                        let since_the_epoch = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("Time went backwards");
+                        guard.number_of_records_total.with_label_values(&[topic.name()]).set(topic_message_count);
+                        guard.last_fetch_ts.with_label_values(&[topic.name()]).set(since_the_epoch.as_secs_f64());
+
+                    },
+                    Err(_) => {
+                         error!("Can't acquire metrics lock for topic={:}", topic.name())
+                    }
+                }
             }
         }
+        results
     }
 }
 
@@ -383,16 +489,17 @@ impl Pipeline {
             .subscribe(topics)
             .expect("Can't subscribe to specified topics");
 
-        let mut stream = (&self.upstream_client).start_with(Duration::from_millis(100), true);
+        let mut stream = (&self.upstream_client).start_with(
+            Duration::from_millis(100), true);
 
         let mut last_info_time = Instant::now();
 
-        let progress_every_secs = self.show_progress_every_secs.unwrap_or(0);
+        let show_progress_interval_secs = self.show_progress_interval_secs.unwrap_or(0);
 
         while let Some(message) = stream.next().await {
             let difference = Instant::now().duration_since(last_info_time);
 
-            if progress_every_secs > 0 && difference.as_secs() > progress_every_secs {
+            if show_progress_interval_secs > 0 && difference.as_secs() > show_progress_interval_secs {
                 last_info_time = Instant::now();
 
                 debug!(
@@ -626,7 +733,7 @@ impl Config {
         Pipeline {
             id: index as u64,
             repartitioning_strategy: route.repartitioning_strategy,
-            show_progress_every_secs: route.progress_every_secs.clone(),
+            show_progress_interval_secs: route.show_progress_interval_secs.clone(),
             upstream_client_name: route.upstream_client.clone(),
             downstream_client_name: route.downstream_client.clone(),
             downstream_topic: route.downstream_topic.clone(),
@@ -650,7 +757,7 @@ impl Config {
         rules
     }
 
-    pub fn get_observers(&self) -> Vec<Observer> {
+    pub fn get_observers(&self, metrics: Arc<Mutex<metrics::ObserverMetrics>>) -> Vec<Observer> {
         let observers: Vec<_> = self
             .observers
             .iter()
@@ -660,15 +767,24 @@ impl Config {
 
                 Observer {
                     client: client.create().expect("Can't create consumer"),
+                    group_id: None,
                     topics: x.topics.clone(),
                     topics_set: x.topics.iter().cloned().collect(),
-                    show_progress_every_secs: x.show_progress_every_secs.clone(),
+                    show_progress_interval_secs: x.show_progress_interval_secs.clone(),
+                    fetch_data_interval_secs: x.fetch_interval_secs.clone(),
                     fetch_timeout_secs: x.fetch_timeout_secs.clone(),
                     name: if let Some(v) = &x.name {
                         v.clone()
                     } else {
                         format!("Observer #{:}", i)
                     },
+
+                    metrics: metrics.clone(),
+                    last_results: HashMap::new(),
+
+                    last_status_time: Instant::now(),
+                    last_update_time: Instant::now()
+
                 }
             })
             .collect();

@@ -2,6 +2,7 @@ use tokio;
 
 #[macro_use]
 extern crate log;
+
 use std::thread;
 
 use rdkafka::{
@@ -12,19 +13,26 @@ use rdkafka::{
 };
 
 use std::{
-    collections::{HashMap, HashSet},
     error::Error,
     marker::Copy,
     time::{Duration, SystemTime},
 };
 
-use std::path::PathBuf;
+use actix_web::{web, App, HttpResponse, HttpServer};
+
+use std::{collections::HashMap, path::PathBuf, sync::{atomic::{Ordering, AtomicBool}, Arc, Mutex}};
 use structopt::StructOpt;
+
 
 use replicator::*;
 
+
+
+use prometheus::{self, IntGauge, IntCounter, TextEncoder, Encoder, Registry, labels};
+
+
 #[derive(StructOpt, Debug)]
-#[structopt(version = get_crate_version())]
+#[structopt(version = cli::get_crate_version())]
 #[structopt(name = "Kafka topics observer")]
 /// Commands help
 pub struct ObserverCommandLine {
@@ -34,8 +42,13 @@ pub struct ObserverCommandLine {
     #[structopt(long)]
     pub validate: bool,
 
-    #[structopt(long = "num", default_value = "5")]
-    pub num: u64,
+    /// Port for listening
+    #[structopt(short = "p", long = "port", default_value = "9444")]
+    pub port: u32,
+
+    /// Host or ip address for listening
+    #[structopt(short = "h", long = "host", default_value = "127.0.0.1")]
+    pub host: String,
 }
 
 pub fn parse_args() -> ObserverCommandLine {
@@ -54,14 +67,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => panic!("Invalid config file: {:?}", &opt.input),
     };
 
+    let running = Arc::new(AtomicBool::new(true));
+
+    let namespace = config.prometheus.clone().map_or(
+        None,
+        |config|config.namespace);
+
+    let labels = config.prometheus.clone().map_or(
+        None,
+        |config| config.labels);
+
+    let observer_metrics = Arc::new(Mutex::new(metrics::ObserverMetrics::new(namespace, labels)));
+
     let mut observers = vec![];
 
-    for observer in config.get_observers() {
-        observers.push(thread::spawn(move || observer.start()));
+    for mut observer in config.get_observers(observer_metrics.clone()) {
+        let is_running = Arc::clone(&running);
+        observers.push(thread::spawn(move || observer.start(is_running)));
     }
 
+    let running_switcher = running.clone();
+
+    ctrlc::set_handler(move || {
+        running_switcher.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
+
+    metrics::run_prometheus_server(&opt.host, opt.port, observer_metrics.clone())?;
+
     for thread in observers {
-        thread.join();
+        thread.join().unwrap();
     }
 
     Ok(())
