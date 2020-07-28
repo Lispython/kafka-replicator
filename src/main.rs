@@ -3,28 +3,21 @@ use tokio;
 #[macro_use]
 extern crate log;
 
-// use tokio::signal::unix::{signal, SignalKind};
-
 use replicator::*;
+use std::{rc::Rc, sync::{Arc, atomic::{Ordering, AtomicBool}, Mutex}};
+use metrics::{run_prometheus_server, PipelineMetrics};
 
-async fn run_replicator(config: config::Config) -> Result<(), Box<dyn std::error::Error>> {
-    for mut route_rule in config.get_routes() {
-        tokio::spawn(async move { route_rule.start().await });
+async fn run_replicator(config: config::Config, is_running: Arc<AtomicBool>, metrics: Arc<Mutex<PipelineMetrics>>) -> Result<(), Box<dyn std::error::Error>> {
+    for mut pipeline in config.get_pipelines(metrics.clone(), is_running.clone()) {
+        tokio::spawn(async move {
+            pipeline.start().await
+
+        });
     }
-    tokio::signal::ctrl_c().await?;
-
-    // let mut stream = signal(SignalKind::hangup())?;
-
-    // // Print whenever a HUP signal is received
-    // loop {
-    //     stream.recv().await;
-    //     println!("got signal HUP");
-    // }
-
-    // // println!("ctrl-c received!");
 
     Ok(())
 }
+
 
 // #[tokio::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +32,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => panic!("Invalid config file: {:?}", &opt.input),
     };
 
+    let running = Arc::new(AtomicBool::new(true));
+
+    let namespace = config.prometheus.clone().map_or(
+        None,
+        |config|config.namespace);
+
+    let labels = config.prometheus.clone().map_or(
+        None,
+        |config| config.labels);
+
+
+    let replicator_metrics = Arc::new(Mutex::new(PipelineMetrics::new(namespace, labels)));
+
     let mut rt = tokio::runtime::Runtime::new().unwrap();
 
     if opt.validate == true {
@@ -46,27 +52,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    rt.block_on(run_replicator(config))
+    let running_switcher = running.clone();
 
-    // rt.block_on(async {
+    ctrlc::set_handler(move || {
+        running_switcher.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
 
-    //     for route_rule in config.get_routes() {
-    //         tokio::spawn(async move {
-    //             route_rule.start().await
-    //         });
-    //     }
-    //     // tokio::signal::ctrl_c().await?;
+    rt.block_on(run_replicator(config, Arc::clone(&running), replicator_metrics.clone()));
 
-    //     let mut stream = signal(SignalKind::hangup())?;
 
-    //     // Print whenever a HUP signal is received
-    //     // loop {
-    //     //     stream.recv().await;
-    //     //     println!("got signal HUP");
-    //     // }
+    run_prometheus_server::<PipelineMetrics>(&opt.host, opt.port, replicator_metrics.clone())?;
 
-    //     // println!("ctrl-c received!");
 
-    //     Ok(())
-    // })
+    Ok(())
 }

@@ -1,13 +1,13 @@
 clusters:
   - name: cluster_1
     hosts:
-      - replicator-kafka-1:9092
-      - replicator-kafka-1:9092
+      #- replicator-kafka-1:9092
+      #- replicator-kafka-1:9092
       - kafka_replicator_replicator_kafka_1_1:9092
   - name: cluster_2
     hosts:
       - kafka_replicator_replicator_kafka_2_1:9092
-      - replicator-kafka-2:9092
+      #- replicator-kafka-2:9092
 
 clients:
   - client: cl_1_client_1
@@ -19,20 +19,20 @@ clients:
     cluster: cluster_2
 
 routes:
-  - upstream_client: cl_1_client_1
-    downstream_client: cl_1_client_1
-    upstream_topics:
+  - upstream_client: cl_1_client_1 # Required: source client name from clients section
+    downstream_client: cl_1_client_1 # Required: target client name from clients section
+    upstream_topics: # Required: source topics
       - 'topic1'
-    downstream_topic: 'topic2'
+    downstream_topic: 'topic2' # Required: target topics
     repartitioning_strategy: random # strict_p2p | random
-    upstream_group_id: group_22
-    show_progress_interval_secs: 10
+    upstream_group_id: group_22 # Option: upstream consumer group id
+    show_progress_interval_secs: 2 # Optional: interval between console output
+    update_metrics_interval_secs: 1 # Optional: interval between prometheus metrics updates
+    upstream_poll_interval_ms: 200 # Optional: interval between upstream poll calls
+    name: route_name # Optional:
     limits:
       messages_per_sec: 10000
       number_of_messages:
-
-    labels:
-      label_key: label_value
 
   - upstream_client: cl_1_client_1
     downstream_client: cl_2_client_1
@@ -60,29 +60,24 @@ observers:
     group_id: "group_id"
     topics:
       - 'topic1'
-      - 'topic2'
+      # - 'topic2'
     fetch_timeout_secs: 5
     fetch_interval_secs: 5
-    show_progress_interval_secs: 5
-    labels:
-      label_key: label_value
-      env: prod
+    show_progress_interval_secs: 1
+    update_metrics_interval_secs: 10
 
   - client: cl_2_client_1
     topic: 'topic3'
     topics:
       - 'topic2'
     show_progress_interval_secsy: 20
-    labels:
-      label_key: label_value2
-      env: stage
 
   - client: cl_1_client_1
     topic: 'topic1'
     topics: []
 
 prometheus:
-  namespace: "app:observer:"
+#  namespace: "app:observer:"
   labels:
     label_key: label_value
     env: prod

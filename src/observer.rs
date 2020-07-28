@@ -29,6 +29,7 @@ use replicator::*;
 
 
 use prometheus::{self, IntGauge, IntCounter, TextEncoder, Encoder, Registry, labels};
+use metrics::{run_prometheus_server, ObserverMetrics};
 
 
 #[derive(StructOpt, Debug)]
@@ -77,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         |config| config.labels);
 
-    let observer_metrics = Arc::new(Mutex::new(metrics::ObserverMetrics::new(namespace, labels)));
+    let observer_metrics: Arc<Mutex<ObserverMetrics>> = Arc::new(Mutex::new(ObserverMetrics::new(namespace, labels)));
 
     let mut observers = vec![];
 
@@ -92,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         running_switcher.store(false, Ordering::SeqCst);
     }).expect("Error setting Ctrl-C handler");
 
-    metrics::run_prometheus_server(&opt.host, opt.port, observer_metrics.clone())?;
+    run_prometheus_server::<ObserverMetrics>(&opt.host, opt.port, observer_metrics.clone())?;
 
     for thread in observers {
         thread.join().unwrap();

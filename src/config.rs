@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use tokio::time::{delay_for};
+
 use rdkafka::{
     client::{ClientContext, DefaultClientContext},
     config::ClientConfig,
@@ -17,7 +19,7 @@ use rdkafka::{
         stream_consumer::{MessageStream, StreamConsumer},
         Consumer, ConsumerContext, DefaultConsumerContext,
     },
-    error::KafkaResult,
+    error::{KafkaError, KafkaResult},
     message::{
         BorrowedHeaders, BorrowedMessage, Headers, Message, OwnedHeaders, OwnedMessage, ToBytes,
     },
@@ -38,10 +40,13 @@ use std::{
 };
 
 use byte_unit::Byte;
-use std::iter::Iterator;
+use std::{ops, iter::Iterator};
 
 
 use super::metrics;
+use metrics::PipelineMetrics;
+use ops::{Add, AddAssign};
+use std::convert::TryFrom;
 // pub struct ProducerContext {
 //     pub some_data: i64, // Add some data so that valgrind can check proper allocation
 // }
@@ -56,7 +61,8 @@ const DEFAULT_SHOW_PROGRESS_INTERVAL_SECS: u64 = 60;
 const DEFAULT_CONFIG_MESSAGE_TIMEOUT: &str = "5000";
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 60;
 const LOOP_ITERATION_SLEEP: u64 = 1;
-
+const DEFAULT_UPDATE_METRICS_INTERVAL_SECS: u64 = 60;
+const DEFAULT_CONSUMER_POLL_INTERVAL: u64 = 100;
 
 pub struct ConsumerTestContext {
     pub _n: i64, // Add data for memory access validation
@@ -179,6 +185,7 @@ enum BeginOffset {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Route {
+    name: Option<String>,
     upstream_group_id: Option<String>,
 
     upstream_client: String,
@@ -192,18 +199,98 @@ pub struct Route {
 
     default_begin_offset: Option<BeginOffset>,
     show_progress_interval_secs: Option<u64>,
+
+    update_metrics_interval_secs: Option<u64>,
+
+    upstream_poll_interval_ms: Option<u64>
 }
+
+#[derive(Debug, Copy, Clone)]
+pub struct DeltaStorage<T>{
+    pub current: T,
+    pub delta: T
+}
+
+
+impl<T: Display> fmt::Display for DeltaStorage<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "DeltaStorage({:}, {:})", self.current, self.delta)
+    }
+}
+
+
+impl DeltaStorage<u64> {
+    pub fn new(current: u64) -> Self {
+        Self::new_with_delta(current, 0)
+    }
+
+    pub fn new_with_delta(current: u64, delta: u64) -> Self {
+        Self {current, delta}
+
+    }
+
+    pub fn get_delta_and_reset(&mut self) -> u64 {
+        let delta = self.delta;
+        self.delta = 0;
+        delta
+    }
+}
+
+// TODO: try to use <T: Into<u64>>
+impl From<u64> for DeltaStorage<u64> {
+    fn from(item: u64) -> Self {
+        Self::new(item)
+    }
+}
+
+impl From<DeltaStorage<u64>> for u64 {
+    fn from(item: DeltaStorage<u64>) -> u64 {
+        item.current
+    }
+
+}
+
+
+impl Add<u64> for DeltaStorage<u64> {
+    type Output = DeltaStorage<u64>;
+
+    fn add(mut self, other: u64) -> Self::Output {
+        self.current += other;
+        self.delta += other;
+        self
+    }
+}
+
+impl Add<DeltaStorage<u64>> for DeltaStorage<u64> {
+    type Output = DeltaStorage<u64>;
+
+    fn add(mut self, other: DeltaStorage<u64>) -> Self::Output {
+        DeltaStorage::new_with_delta(self.current + other.current,
+                                  self.delta + other.delta)
+    }
+}
+
+
+impl AddAssign<u64> for DeltaStorage<u64> {
+    fn add_assign(&mut self, other: u64) {
+        self.current += other;
+        self.delta += other
+    }
+}
+
+
 
 // TODO: realize default trait
 pub struct PipelineStats {
-    start_time: SystemTime,
-    received: u64,
-    replicated: u64,
+    start_ts: SystemTime,
+    received: DeltaStorage<u64>,
+    transfered: DeltaStorage<u64>,
     cumulative_duration: u64,
     // number_of_bytes: u64,
-    keys_bytes: u64,
-    payload_bytes: u64,
-    headers_bytes: u64,
+    keys_bytes: DeltaStorage<u64>,
+    payload_bytes: DeltaStorage<u64>,
+    headers_bytes: DeltaStorage<u64>,
+    last_receive_ts: Option<SystemTime>
 }
 
 impl fmt::Display for PipelineStats {
@@ -211,7 +298,7 @@ impl fmt::Display for PipelineStats {
         write!(
             f,
             "Stats( messages={:} dur={:?}/{:.3?} volume={:} rate={:}/sec )",
-            self.replicated,
+            self.transfered.current,
             self.get_avg_duration(),
             Duration::from_nanos(self.cumulative_duration),
             Byte::from_bytes(self.get_bytes_size() as u128).get_appropriate_unit(true),
@@ -220,17 +307,29 @@ impl fmt::Display for PipelineStats {
     }
 }
 
+
 pub struct Pipeline {
     id: u64,
+    name: String,
     downstream_topic: String,
     upstream_topics: Vec<String>,
-    upstream_client: StreamConsumer,
+    // upstream_client: StreamConsumer,
+    upstream_client: ClientConfig,
     downstream_client: FutureProducer<DefaultClientContext>,
     upstream_client_name: String,
     downstream_client_name: String,
     show_progress_interval_secs: Option<u64>,
+
+    last_metrics_update_time: Instant,
+    update_metrics_interval_secs: Option<u64>,
+
     repartitioning_strategy: RepartitioningStrategy,
     stats: PipelineStats,
+    metrics: Arc<Mutex<PipelineMetrics>>,
+    is_running: Arc<AtomicBool>,
+    last_status_update_time: Instant,
+    upstream_poll_interval: Option<u64>
+    // message_stream: Option<MessageStream<'a, DefaultConsumerContext>>
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -277,25 +376,15 @@ impl fmt::Debug for Observer {
 impl PipelineStats {
     pub fn new() -> Self {
         PipelineStats {
-            received: 0,
-            replicated: 0,
+            received: DeltaStorage::new(0),
+            transfered: DeltaStorage::new(0),
             cumulative_duration: 0,
-            start_time: SystemTime::now(),
-
-            keys_bytes: 0,
-            payload_bytes: 0,
-            headers_bytes: 0,
+            start_ts: SystemTime::now(),
+            last_receive_ts: None,
+            keys_bytes:  DeltaStorage::new(0),
+            payload_bytes: DeltaStorage::new(0),
+            headers_bytes: DeltaStorage::new(0),
         }
-    }
-
-    pub fn increase_replicated(&mut self) {
-        self.replicated += 1;
-    }
-
-    pub fn update_bytes(&mut self, keys: usize, payload: usize, headers: usize) {
-        self.keys_bytes += keys as u64;
-        self.payload_bytes += payload as u64;
-        self.headers_bytes += headers as u64;
     }
 
     pub fn update_cumulative(&mut self, value: Duration) {
@@ -303,8 +392,9 @@ impl PipelineStats {
     }
 
     pub fn get_avg_duration(&self) -> Duration {
-        let duration = if self.replicated > 0 {
-            self.cumulative_duration / self.replicated as u64
+        let duration = if self.transfered.current > 0 {
+            // TODO: impl From for self.replicated.current
+            self.cumulative_duration / self.transfered.current as u64
         } else {
             0
         };
@@ -313,7 +403,7 @@ impl PipelineStats {
     }
 
     pub fn get_bytes_size(&self) -> u64 {
-        self.keys_bytes + self.payload_bytes + self.headers_bytes
+        (self.keys_bytes + self.payload_bytes + self.headers_bytes).into()
     }
 
     pub fn get_data_rate(&self) -> u64 {
@@ -328,18 +418,18 @@ impl PipelineStats {
 impl Observer {
 
     pub fn start(&mut self, is_running: Arc<AtomicBool>) {
-        {
-            if self.topics.len() > 0 {
-                info!(
-                    "Starting {:} for topics \"{:}\"",
-                    self.name,
-                    self.topics.join(", ")
-                );
-            } else {
-                info!("Starting {:} all broker topics", self.name);
-            };
 
-        }
+        if self.topics.len() > 0 {
+            info!(
+                "Starting {:} for topics \"{:}\"",
+                self.name,
+                self.topics.join(", ")
+            );
+        } else {
+            info!("Starting {:} all broker topics", self.name);
+        };
+
+
 
         let loop_sleep = Duration::from_secs(LOOP_ITERATION_SLEEP);
 
@@ -441,7 +531,7 @@ impl Observer {
 
                             guard.number_of_records_for_partition.with_label_values(&labels).set(partition_message_count);
                         },
-                        Err(poisoned) => {
+                        Err(_poisoned) => {
                             error!("Can't acquire metrics lock for topic={:} and partition={:}", topic.name(), &partition.id());
                         },
 
@@ -472,121 +562,264 @@ impl Observer {
 }
 
 impl Pipeline {
-    pub async fn start(&mut self) {
-        info!(
-            "Starting replication {:} [ {:} ] -> {:} [ {:} ] strategy={:}",
-            &self.upstream_client_name,
-            &self.upstream_topics.join(","),
-            &self.downstream_client_name,
-            &self.downstream_topic,
-            &self.repartitioning_strategy
-        );
 
-        let topics: &Vec<&str> = &self.upstream_topics.iter().map(|x| &**x).collect();
+    // Subscribe upstream client to topics
+    pub fn get_upstream_stream(&self) -> StreamConsumer {
+        let topics: Vec<&str> = self.upstream_topics.iter().map(|x| &**x).collect();
 
-        &self
-            .upstream_client
-            .subscribe(topics)
+        let client: StreamConsumer = self.upstream_client.create().expect("Can't create consumer");
+
+        info!("Subscribe upstream topics {:} [ {:} ] -> {:} [ {:} ]",
+              self.upstream_client_name,
+              self.upstream_topics.join(","),
+              self.downstream_client_name,
+              self.downstream_topic);
+        client.subscribe(&topics)
             .expect("Can't subscribe to specified topics");
 
-        let mut stream = (&self.upstream_client).start_with(
-            Duration::from_millis(100), true);
+        client
 
-        let mut last_info_time = Instant::now();
+    }
 
-        let show_progress_interval_secs = self.show_progress_interval_secs.unwrap_or(0);
+    pub async fn start(&mut self) {
+        info!(
+            "Starting replication {:} {:} [ {:} ] -> {:} [ {:} ] strategy={:}",
+            self.name,
+            self.upstream_client_name,
+            self.upstream_topics.join(","),
+            self.downstream_client_name,
+            self.downstream_topic,
+            self.repartitioning_strategy
+        );
 
-        while let Some(message) = stream.next().await {
-            let difference = Instant::now().duration_since(last_info_time);
-
-            if show_progress_interval_secs > 0 && difference.as_secs() > show_progress_interval_secs {
-                last_info_time = Instant::now();
-
-                debug!(
-                    "Pipeline {:} status {:} [{:}] -> {:} [{:}]: {:}",
-                    self.id,
-                    self.upstream_client_name,
-                    self.upstream_topics.join(","),
-                    self.downstream_client_name,
-                    self.downstream_topic,
-                    self.stats,
-                    // &received,
-                    // &replicated,
-                    // Duration::from_nanos(avg_duration as u64)
-                )
-            };
-
-            match message {
-                Err(_e) => {
-                    // println!(">>>>> {:}", e);
-                }
-                Ok(message_content) => {
-                    let received_time = Instant::now();
-
-                    let unwraped_message = &message_content;
-
-                    let input_payload = &unwraped_message.payload();
-                    let input_key = &unwraped_message.key();
-                    let input_headers = &unwraped_message.headers();
-
-                    let mut record: FutureRecord<'_, [u8], [u8]> =
-                        FutureRecord::to(&self.downstream_topic);
-
-                    if (&input_payload).is_some() == true {
-                        record = record.payload(&input_payload.unwrap());
-                    };
-
-                    if (&input_key).is_some() == true {
-                        record = record.key(&input_key.unwrap());
-                    };
-
-                    let mut headers_len = 0;
-
-                    // TODO: maybe try convert BorrowedHeaders ?
-                    if input_headers.is_some() == true {
-                        let mut new_headers = OwnedHeaders::new();
-
-                        for i in 0..input_headers.unwrap().count() {
-                            let header = input_headers.unwrap().get(i);
-                            if let Some((key, value)) = header {
-                                new_headers = new_headers.add(key, value);
-                                headers_len += key.len() + value.len();
-                            }
-                        }
-                        record = record.headers(new_headers);
-                    };
-
-                    if let RepartitioningStrategy::StrictP2P = &self.repartitioning_strategy {
-                        record = record.partition(unwraped_message.partition());
-                    }
-
-                    &self.downstream_client.send(record, 0);
-
-                    self.stats.increase_replicated();
-                    self.stats.update_bytes(
-                        unwraped_message.key_len(),
-                        unwraped_message.payload_len(),
-                        headers_len,
-                    );
-
-                    // dbg!((SystemTime::now(), &received_time));
-                    let duration = Instant::now().duration_since(received_time);
-
-                    self.stats.update_cumulative(duration);
-                }
+        match self.metrics.lock() {
+            Ok(guard) =>{
+                // TODO: add some codes?
+                // TODO: move labels values to method
+                 let start_ts = self.stats.start_ts
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards").as_secs_f64();
+                guard.start_ts.with_label_values(&self.get_metrics_labels()).set(start_ts)
+            },
+            Err(_poisoned) => {
+                error!("Can't acquire metrics for {:} {:} [ {:} ] -> {:} [ {:} ]",
+                       self.name,
+                       self.upstream_client_name,
+                       self.upstream_topics.join(","),
+                       self.downstream_client_name,
+                       self.downstream_topic);
             }
-
-            // upstream_client.commit_message(&m, CommitMode::Async).unwrap();
-            // downstream_producer.flush(Timeout::Never);
         }
 
+        let upstream_client = self.get_upstream_stream();
+        let mut stream = upstream_client.start_with(
+            Duration::from_millis(self.upstream_poll_interval.unwrap_or(DEFAULT_CONSUMER_POLL_INTERVAL)), true);
+
+        while self.is_running.load(Ordering::SeqCst) {
+
+            if let Some(message) = stream.next().await {
+                match message {
+                    Err(KafkaError::NoMessageReceived) => {
+                        // delay_for(Duration::from_secs(1)).await;
+                        // error!("Received error {:?}", KafkaError::NoMessageReceived);
+                    },
+                    Err(error) => {
+                        error!("Received error {:?}", error);
+
+                        match self.metrics.lock() {
+                            Ok(guard) =>{
+                                // TODO: add some codes?
+                                // TODO: move labels values to method
+                                guard.errors_total.with_label_values(&self.get_metrics_labels()).inc_by(1)
+                            },
+                            Err(_poisoned) => {
+                                error!("Can't acquire metrics for {:} {:} [ {:} ] -> {:} [ {:} ]",
+                                       self.name,
+                                       self.upstream_client_name,
+                                       self.upstream_topics.join(","),
+                                       self.downstream_client_name,
+                                       self.downstream_topic);
+                            }
+                        }
+                    }
+                    Ok(message_content) => {
+                        self.pump_message(message_content);
+                    }
+                };
+
+            };
+            self.update_metrics_if_need();
+            self.print_status_if_need();
+        }
+
+        info!("Unsubscribe upstream topics and flush producer queue {:} {:} [ {:} ] -> {:} [ {:} ]",
+              self.name,
+              self.upstream_client_name,
+              self.upstream_topics.join(","),
+              self.downstream_client_name,
+              self.downstream_topic);
+
+        upstream_client.unsubscribe();
+
+        self.downstream_client.flush(Duration::from_secs(10));
+
+        self.update_metrics();
+
         info!(
-            "Finishing replication {:} [ {:} ] -> {:} [ {:} ]",
-            &self.upstream_client_name,
-            &self.upstream_topics.join(","),
-            &self.downstream_client_name,
-            &self.downstream_topic
+            "Finishing replication {:} {:} [ {:} ] -> {:} [ {:} ]",
+            self.name,
+            self.upstream_client_name,
+            self.upstream_topics.join(","),
+            self.downstream_client_name,
+            self.downstream_topic
         );
+    }
+
+    fn update_metrics_if_need(&mut self){
+        let update_metrics_interval_secs = self.update_metrics_interval_secs.unwrap_or(DEFAULT_UPDATE_METRICS_INTERVAL_SECS);
+
+        let difference = Instant::now().duration_since(self.last_metrics_update_time);
+
+        if update_metrics_interval_secs > 0 && difference.as_secs() > update_metrics_interval_secs {
+
+            self.update_metrics();
+
+        }
+    }
+
+    pub fn update_metrics(&mut self){
+        self.last_metrics_update_time = Instant::now();
+
+        let labels: [&str; 3] = [&self.name, &self.upstream_client_name, &self.downstream_client_name];
+
+        match self.metrics.lock() {
+            Ok(guard) => {
+
+                guard.received_total.with_label_values(&labels).inc_by(i64::try_from(self.stats.received.get_delta_and_reset()).unwrap_or(0));
+                guard.transfered_total.with_label_values(&labels).inc_by(i64::try_from(self.stats.transfered.get_delta_and_reset()).unwrap_or(0));
+
+                let headers_bytes = self.stats.headers_bytes.get_delta_and_reset();
+                let keys_bytes = self.stats.keys_bytes.get_delta_and_reset();
+                let payload_bytes = self.stats.payload_bytes.get_delta_and_reset();
+                let total_bytes = headers_bytes + keys_bytes + payload_bytes;
+
+                guard.keys_bytes.with_label_values(&labels).inc_by(i64::try_from(keys_bytes).unwrap_or(0));
+                guard.headers_bytes.with_label_values(&labels).inc_by(i64::try_from(headers_bytes).unwrap_or(0));
+
+                guard.payload_bytes.with_label_values(&labels).inc_by(i64::try_from(payload_bytes).unwrap_or(0));
+                guard.total_bytes.with_label_values(&labels).inc_by(i64::try_from(total_bytes).unwrap_or(0));
+                guard.avg_transfer_duration.with_label_values(&labels).set(self.stats.get_avg_duration().as_secs_f64());
+
+                if let Some(value) = self.stats.last_receive_ts {
+
+                    let last_receive_ts = value
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards").as_secs_f64();
+                    guard.last_receive_ts.with_label_values(&labels).set(last_receive_ts);
+
+                }
+
+            },
+            Err(poisoned) => {
+                error!("Can't acquire metrics for {:} {:} [ {:} ] -> {:} [ {:} ]",
+                       self.name,
+                       self.upstream_client_name,
+                       self.upstream_topics.join(","),
+                       self.downstream_client_name,
+                       self.downstream_topic);
+            }
+        }
+    }
+
+    pub fn get_metrics_labels(&self) -> [&str; 3]{
+        [&self.name, &self.upstream_client_name, &self.downstream_client_name]
+    }
+
+    pub fn print_status(&mut self) {
+        self.last_status_update_time = Instant::now();
+
+        debug!(
+            "{:} status {:} [{:}] -> {:} [{:}]: {:}",
+            self.name,
+            self.upstream_client_name,
+            self.upstream_topics.join(","),
+            self.downstream_client_name,
+            self.downstream_topic,
+            self.stats,
+            // &received,
+            // &replicated,
+            // Duration::from_nanos(avg_duration as u64)
+        )
+
+    }
+
+    pub fn print_status_if_need(&mut self) {
+        let show_progress_interval_secs = self.show_progress_interval_secs.unwrap_or(0);
+
+        let difference = Instant::now().duration_since(self.last_status_update_time);
+
+        if show_progress_interval_secs > 0 && difference.as_secs() > show_progress_interval_secs {
+
+            self.print_status();
+        };
+    }
+
+    pub fn pump_message(&mut self, message_content: BorrowedMessage) {
+        let received_time = Instant::now();
+        self.stats.last_receive_ts = Some(SystemTime::now());
+        self.stats.received += 1;
+
+        let unwraped_message = &message_content;
+
+        let input_payload = &unwraped_message.payload();
+        let input_key = &unwraped_message.key();
+        let input_headers = &unwraped_message.headers();
+
+        let mut record: FutureRecord<'_, [u8], [u8]> =
+            FutureRecord::to(&self.downstream_topic);
+
+        if (&input_payload).is_some() == true {
+            record = record.payload(&input_payload.unwrap());
+        };
+
+        if (&input_key).is_some() == true {
+            record = record.key(&input_key.unwrap());
+        };
+
+        let mut headers_len = 0;
+
+        // TODO: maybe try convert BorrowedHeaders ?
+        if input_headers.is_some() == true {
+            let mut new_headers = OwnedHeaders::new();
+
+            for i in 0..input_headers.unwrap().count() {
+                let header = input_headers.unwrap().get(i);
+                if let Some((key, value)) = header {
+                    new_headers = new_headers.add(key, value);
+                    headers_len += key.len() + value.len();
+                }
+            }
+            record = record.headers(new_headers);
+        };
+
+        if let RepartitioningStrategy::StrictP2P = &self.repartitioning_strategy {
+            record = record.partition(unwraped_message.partition());
+        }
+
+        // &self.downstream_client.send(record, Duration::from_secs(0));
+
+        self.downstream_client.send(record, 0);
+
+        // Update statistics
+        self.stats.transfered += 1;
+        self.stats.keys_bytes += unwraped_message.key_len() as u64;
+        self.stats.payload_bytes += unwraped_message.payload_len() as u64;
+        self.stats.headers_bytes += headers_len as u64;
+
+        let duration = Instant::now().duration_since(received_time);
+
+        self.stats.update_cumulative(duration);
+
     }
 }
 
@@ -694,7 +927,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn get_route_clients(&self, index: usize) -> Pipeline {
+    pub fn get_pipeline(&self, index: usize, metrics: Arc<Mutex<PipelineMetrics>>, is_running: Arc<AtomicBool>) -> Pipeline {
         let route = &self.routes[index];
 
         let group_id: Option<&str> = (&route.upstream_group_id).as_deref();
@@ -732,27 +965,36 @@ impl Config {
 
         Pipeline {
             id: index as u64,
+            name: route.name.clone().unwrap_or(format!("Pipeline #{:}", index)),
             repartitioning_strategy: route.repartitioning_strategy,
             show_progress_interval_secs: route.show_progress_interval_secs.clone(),
             upstream_client_name: route.upstream_client.clone(),
             downstream_client_name: route.downstream_client.clone(),
             downstream_topic: route.downstream_topic.clone(),
             upstream_topics: route.upstream_topics.clone(),
-            upstream_client: upstream_client.create().expect("Can't create consumer"),
+            // upstream_client: upstream_client.create().expect("Can't create consumer"),
+            upstream_client: upstream_client,
             downstream_client: downstream_client
                 .create()
                 .expect("Failed to create producer"), // repartitioning_strategy: route.repartitioning_strategy.copy()
 
+            last_metrics_update_time: Instant::now(),
+            last_status_update_time: Instant::now(),
+            update_metrics_interval_secs: route.show_progress_interval_secs.clone(),
             stats: PipelineStats::new(),
+            metrics,
+            is_running,
+            upstream_poll_interval: route.upstream_poll_interval_ms.clone(),
+            // message_stream: None
         }
     }
 
-    pub fn get_routes(&self) -> Vec<Pipeline> {
+    pub fn get_pipelines(&self, metrics: Arc<Mutex<PipelineMetrics>>, is_running: Arc<AtomicBool>) -> Vec<Pipeline> {
         let rules: Vec<_> = self
             .routes
             .iter()
             .enumerate()
-            .map(|(pos, _)| self.get_route_clients(pos))
+            .map(|(pos, _)| self.get_pipeline(pos, metrics.clone(), is_running.clone()))
             .collect();
         rules
     }
