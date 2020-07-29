@@ -26,7 +26,7 @@ use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     statistics::Statistics,
     util::Timeout,
-    TopicPartitionList,
+    TopicPartitionList, topic_partition_list::TopicPartitionListElem, groups::GroupList, metadata::Metadata,
 };
 
 use futures::{future, stream::StreamExt};
@@ -342,6 +342,7 @@ pub struct PrometheusConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ObserverConfig {
     client: String,
+    group_id: Option<String>,
     topics: Vec<String>,
     show_progress_interval_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
@@ -362,7 +363,7 @@ pub struct Observer {
 
     last_status_time: Instant,
     last_update_time: Instant,
-    last_results: HashMap<String, i64>,
+    last_results: HashMap<String, (i64, i64)>,
 
     metrics: Arc<Mutex<metrics::ObserverMetrics>>,
 }
@@ -449,8 +450,7 @@ impl Observer {
         let difference = Instant::now().duration_since(self.last_update_time);
 
         if self.get_fetch_interval().as_secs() > 0 && difference > self.get_fetch_interval() {
-            let results = self.update_current_status();
-            self.last_results = results;
+            self.last_results = self.update_current_status();
             self.last_update_time = Instant::now();
         }
     }
@@ -461,8 +461,13 @@ impl Observer {
 
         if self.get_show_progress_interval().as_secs() > 0 && difference > self.get_show_progress_interval() {
 
-            for (name, count) in self.last_results.iter() {
-                 info!("\"{:}\": topic \"{:}\" has {:} message(s)", self.name, name, count);
+            for (name, (count, remaining)) in self.last_results.iter() {
+                if let Some(group_id) = self.group_id.clone(){
+                    info!("\"{:}\": topic=\"{:}\" group=\"{:}\" messages={:} remaining={:}", self.name, name, group_id, count, remaining);
+
+                }else {
+                    info!("\"{:}\": topic \"{:}\" messages={:} remaining={:}", self.name, name, count, remaining);
+                }
             }
             self.last_status_time = Instant::now();
         }
@@ -489,9 +494,9 @@ impl Observer {
         )
     }
 
-    pub fn update_current_status(&self) -> HashMap<String, i64> {
+    pub fn update_current_status(&self) -> HashMap<String, (i64, i64)> {
 
-        let mut results: HashMap<String, i64> = HashMap::new();
+        let mut results: HashMap<String, (i64, i64)> = HashMap::new();
 
         let topic: Option<&str> =
             if self.topics.len() == 1 {
@@ -500,15 +505,48 @@ impl Observer {
                 None
         };
 
-        let metadata = self
+        let metadata: Metadata = self
             .client
             .fetch_metadata(topic, self.get_fetch_timeout())
             .expect("Failed to fetch metadata");
 
+        // let groups: GroupList = self.client.fetch_group_list(None, Duration::from_secs(20)).unwrap();
+
+        // for item in groups.groups() {
+        //     debug!("Group name: {:}", item.name());
+
+        // }
+
         for topic in metadata.topics().iter() {
             if self.topics_set.contains(topic.name()) || self.topics_set.len() == 0 {
+
+
+                let tp_map: HashMap<(String, i32), rdkafka::Offset> = topic.partitions()
+                    .iter()
+                    .map(|partition_md|{
+                        ((topic.name().to_string(), partition_md.id()), rdkafka::Offset::Stored)
+                    }).collect();
+
+                let tpl = TopicPartitionList::from_topic_map(&tp_map);
+                let commited_offsets = self.client.committed_offsets(tpl, self.get_fetch_timeout()).unwrap_or(TopicPartitionList::new());
+
+
                 let mut topic_message_count = 0;
+                let mut topic_remaining_count = 0;
                 for partition in topic.partitions() {
+
+                    let tpl_item: Option<TopicPartitionListElem> = commited_offsets.find_partition(topic.name(), partition.id());
+
+                    let mut current_partition_offset = 0;
+                    if let Some(value) = tpl_item {
+                        match value.offset(){
+                            rdkafka::Offset::Offset(offset) => {
+                                current_partition_offset = offset;
+                            },
+                            _ => {}
+                        }
+                    }
+
                     let (low, high) = self
                         .client
                         .fetch_watermarks(
@@ -520,6 +558,9 @@ impl Observer {
                     let partition_message_count = high - low;
                     topic_message_count += partition_message_count;
 
+                    let partition_remaining_count = high - current_partition_offset;
+                    topic_remaining_count += partition_remaining_count;
+
                     let labels = [topic.name(), &partition.id().to_string()];
 
                     match self.metrics.lock() {
@@ -530,6 +571,13 @@ impl Observer {
                             guard.partition_end_offset.with_label_values(&labels).set(high);
 
                             guard.number_of_records_for_partition.with_label_values(&labels).set(partition_message_count);
+
+                            if let Some(group_id) = self.group_id.clone() {
+                                let labels = [topic.name(), &partition.id().to_string(), &group_id];
+                                guard.commited_offset.with_label_values(&labels).set(current_partition_offset);
+                                guard.remaining_by_partition.with_label_values(&labels).set(partition_remaining_count);
+
+                            }
                         },
                         Err(_poisoned) => {
                             error!("Can't acquire metrics lock for topic={:} and partition={:}", topic.name(), &partition.id());
@@ -540,7 +588,7 @@ impl Observer {
 
                 }
 
-                results.insert(topic.name().to_string(), topic_message_count);
+                results.insert(topic.name().to_string(), (topic_message_count, topic_remaining_count));
 
                 match self.metrics.lock() {
                     Ok(guard) => {
@@ -549,6 +597,10 @@ impl Observer {
                             .expect("Time went backwards");
                         guard.number_of_records_total.with_label_values(&[topic.name()]).set(topic_message_count);
                         guard.last_fetch_ts.with_label_values(&[topic.name()]).set(since_the_epoch.as_secs_f64());
+
+                        if let Some(group_id) = self.group_id.clone() {
+                            guard.remaining_for_topic.with_label_values(&[topic.name(), &group_id]).set(topic_remaining_count);
+                        }
 
                     },
                     Err(_) => {
@@ -720,7 +772,7 @@ impl Pipeline {
                 }
 
             },
-            Err(poisoned) => {
+            Err(_poisoned) => {
                 error!("Can't acquire metrics for {:} {:} [ {:} ] -> {:} [ {:} ]",
                        self.name,
                        self.upstream_client_name,
@@ -1005,11 +1057,12 @@ impl Config {
             .iter()
             .enumerate()
             .map(|(i, x)| {
-                let client: ClientConfig = self.create_client_config(&x.client, None);
+
+                let client: ClientConfig = self.create_client_config(&x.client, (x.group_id).as_deref());
 
                 Observer {
                     client: client.create().expect("Can't create consumer"),
-                    group_id: None,
+                    group_id: x.group_id.clone(),
                     topics: x.topics.clone(),
                     topics_set: x.topics.iter().cloned().collect(),
                     show_progress_interval_secs: x.show_progress_interval_secs.clone(),

@@ -56,28 +56,26 @@ routes:
 
 observers:
   - client: cl_1_client_1
-    name: "my name"
-    group_id: "group_id"
+    name: "Observer name"
+    group_id: group_22
     topics:
       - 'topic1'
       # - 'topic2'
-    fetch_timeout_secs: 5
-    fetch_interval_secs: 5
-    show_progress_interval_secs: 1
-    update_metrics_interval_secs: 10
+    fetch_timeout_secs: 5 # default: 5
+    fetch_interval_secs: 60 # default:
+    show_progress_interval_secs: 10 # default: 60
 
   - client: cl_2_client_1
-    topic: 'topic3'
+    # group_id: group_2
     topics:
       - 'topic2'
     show_progress_interval_secsy: 20
 
   - client: cl_1_client_1
-    topic: 'topic1'
-    topics: []
+    topics: [] # process all topics
 
 prometheus:
-#  namespace: "app:observer:"
+#  namespace: "app:observer:" # custom prometheus metrics prefix
   labels:
     label_key: label_value
     env: prod

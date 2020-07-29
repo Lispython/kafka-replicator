@@ -12,9 +12,7 @@ const DEFAULT_REPLICATOR_NAMESPACE: &str = "service:kafka_replicator:";
 
 
 pub trait Metrics: Sync + Send + 'static {
-    // fn get_metrics(&self) -> String {
-    //     String::from("vfvasfadsfsa")
-    // }
+
     fn get_registry(&self) -> &Registry;
     fn get_metrics(&self) -> String {
         let mut buffer = vec![];
@@ -177,7 +175,10 @@ pub struct ObserverMetrics {
     pub partition_start_offset: IntGaugeVec,
     pub partition_end_offset: IntGaugeVec,
     pub number_of_records_for_partition: IntGaugeVec,
-    pub last_fetch_ts: GaugeVec
+    pub last_fetch_ts: GaugeVec,
+    pub commited_offset: IntGaugeVec,
+    pub remaining_by_partition: IntGaugeVec,
+    pub remaining_for_topic: IntGaugeVec
 }
 
 impl ObserverMetrics {
@@ -234,6 +235,36 @@ impl ObserverMetrics {
         let last_fetch_ts: GaugeVec = GaugeVec::new(opts, &["topic"]).unwrap();
         registry.register(Box::new(last_fetch_ts.clone())).expect("Can't register metric");
 
+        let label_names = ["topic", "partition", "group"];
+
+
+        let opts= Opts::new(
+            vec!(namespace.clone(), "commited_offset".to_string()).join(""),
+            "commited offset for partition".to_string()).const_labels(labels.clone());
+
+        let commited_offset: IntGaugeVec = IntGaugeVec::new(opts, &label_names).unwrap();
+
+        let opts= Opts::new(
+            vec!(namespace.clone(), "remaining_by_partition".to_string()).join(""),
+            "commited offset for partition".to_string()).const_labels(labels.clone());
+
+        let remaining_by_partition: IntGaugeVec = IntGaugeVec::new(opts, &label_names).unwrap();
+
+        let opts= Opts::new(
+            vec!(namespace.clone(), "remaining_for_topic".to_string()).join(""),
+            "remaining records for topics".to_string()).const_labels(labels.clone());
+
+        let remaining_for_topic: IntGaugeVec = IntGaugeVec::new(opts, &["topic", "group"]).unwrap();
+
+        let metrics = [
+            &commited_offset,
+            &remaining_by_partition,
+            &remaining_for_topic];
+
+        for item in metrics.iter() {
+            registry.register(Box::new((*item).clone())).expect("Can't register metric");
+        }
+
 
         Self { registry,
                namespace,
@@ -242,7 +273,10 @@ impl ObserverMetrics {
                partition_start_offset,
                partition_end_offset,
                number_of_records_for_partition,
-               last_fetch_ts
+               last_fetch_ts,
+               commited_offset,
+               remaining_for_topic,
+               remaining_by_partition
         }
 
     }

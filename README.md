@@ -14,7 +14,7 @@ Lets start with an overview of features that exist in kafka-replicator:
   * [x] **Flexible topic selection:** Select topics with configurable config;
   * [ ] **Auto-create topics:** Destination topics are automatically created for strict_p2p strategy;
   * [x] **Stats:** The tool shows replication status;
-  * [ ] **Monitoring:** Kafka replicator exports stats via prometheus.
+  * [x] **Monitoring:** Kafka replicator exports stats via prometheus.
   * [ ] **Cycle detection**
 
 
@@ -133,11 +133,13 @@ routes:
 observers:
   - client: cl_1_client_1
     name: "my name"
-    topics:
+    group_id: group_name # used for remaining metrics
+    topics: # filter by topics
       - 'topic1'
       - 'topic2'
-    fetch_timeout_secs: 5
-    show_progress_interval_secs: 10
+    fetch_timeout_secs: 5 # default: 5
+    fetch_interval_secs: 5 # default: 60
+    show_progress_interval_secs: 10 # default: 60
 
   - client: cl_2_client_1
     topic: 'topic3'
@@ -148,7 +150,7 @@ observers:
 
   - client: cl_1_client_1
     topic: 'topic1'
-    topics: []
+    topics: [] # fetch all topics
 ```
 
 
