@@ -30,6 +30,11 @@ env_logger = "0.7.1"
 futures = "0.3.0"
 byte-unit = "4.0.6"
 pretty-bytes = "0.2.2"
+prometheus = "0.9.0"
+lazy_static = "1.4.0"
+actix-web = "2.0.0"
+actix-rt = "1.1.1"
+ctrlc = "3.1.5"
 
 
 [profile.dev]
@@ -46,7 +51,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "kafka-replicator"
 path = "src/main.rs"
-
 
 [[bin]]
 name = "kafka-producer"

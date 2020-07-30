@@ -1,5 +1,5 @@
 shell:
-	docker-compose -f docker-compose.yml run --rm  --use-aliases --service-ports app /bin/bash
+	docker-compose -f docker-compose.yml run --rm  --use-aliases app /bin/bash
 
 build:
 	docker-compose -f docker-compose.yml build
@@ -8,7 +8,7 @@ build:
 replicator:
 	# docker-compose -f docker-compose.yml run --rm  --service-ports app cargo run --bin=replicator --verbose -- --config=fixtures/example_config.toml -p 9445 -h 0.0.0.0
 
-	docker-compose -f docker-compose.yml run --rm --use-aliases --service-ports app cargo run --bin=replicator --verbose -- examples/example_config.toml
+	docker-compose -f docker-compose.yml run --rm --use-aliases app cargo run --bin=kafka-replicator --verbose -- examples/example-config.yaml
 
 up:
 	docker-compose -f docker-compose.yml up --rm

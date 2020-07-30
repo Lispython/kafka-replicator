@@ -19,7 +19,7 @@ use structopt::StructOpt;
 use replicator::*;
 
 #[derive(StructOpt, Debug)]
-#[structopt(version = "get_crate_version()")]
+#[structopt(version = cli::get_crate_version())]
 #[structopt(name = "producer")]
 /// Commands help
 pub struct ProducerCommandLine {

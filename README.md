@@ -14,7 +14,7 @@ Lets start with an overview of features that exist in kafka-replicator:
   * [x] **Flexible topic selection:** Select topics with configurable config;
   * [ ] **Auto-create topics:** Destination topics are automatically created for strict_p2p strategy;
   * [x] **Stats:** The tool shows replication status;
-  * [ ] **Monitoring:** Kafka replicator exports stats via prometheus.
+  * [x] **Monitoring:** Kafka replicator exports stats via prometheus.
   * [ ] **Cycle detection**
 
 
@@ -105,7 +105,7 @@ routes:
     downstream_topic: 'topic2'
     repartitioning_strategy: random # strict_p2p | random
     upstream_group_id: group_22
-    progress_every_secs: 10
+    show_progress_interval_secs: 10
     limits:
       messages_per_sec: 10000
       number_of_messages:
@@ -117,7 +117,7 @@ routes:
     downstream_topic: 'topic2'
     repartitioning_strategy: strict_p2p
     upstream_group_id: group_22
-    progress_every_secs: 10
+    show_progress_interval_secs: 10
 
   - upstream_client: cl_2_client_1
     downstream_client: cl_1_client_1
@@ -127,28 +127,30 @@ routes:
     repartitioning_strategy: strict_p2p # strict_p2p | random
     default_begin_offset: earliest # optional
     upstream_group_id: group_2
-    progress_every_secs: 10
+    show_progress_interval_secs: 10
 
 
 observers:
   - client: cl_1_client_1
     name: "my name"
-    topics:
+    group_id: group_name # used for remaining metrics
+    topics: # filter by topics
       - 'topic1'
       - 'topic2'
-    fetch_timeout_secs: 5
-    show_progress_every_secs: 10
+    fetch_timeout_secs: 5 # default: 5
+    fetch_interval_secs: 5 # default: 60
+    show_progress_interval_secs: 10 # default: 60
 
   - client: cl_2_client_1
     topic: 'topic3'
     topics:
       - 'topic2'
-    show_progress_every_secs: 5
+    show_progress_interval_secs: 5
 
 
   - client: cl_1_client_1
     topic: 'topic1'
-    topics: []
+    topics: [] # fetch all topics
 ```
 
 

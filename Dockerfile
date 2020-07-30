@@ -1,4 +1,4 @@
-FROM rust:1.44.1
+FROM rust:1.45.0
 
 
 RUN apt-get update -y && apt-get install -y \
