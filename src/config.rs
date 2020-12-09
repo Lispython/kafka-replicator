@@ -450,8 +450,16 @@ impl Observer {
         let difference = Instant::now().duration_since(self.last_update_time);
 
         if self.get_fetch_interval().as_secs() > 0 && difference > self.get_fetch_interval() {
-            self.last_results = self.update_current_status();
-            self.last_update_time = Instant::now();
+            match self.update_current_status() {
+                Ok(results) => {
+                    self.last_results = results;
+                    self.last_update_time = Instant::now();
+                },
+                Err(text) => {
+                    error!("{}", text);
+                }
+            }
+
         }
     }
 
@@ -494,7 +502,7 @@ impl Observer {
         )
     }
 
-    pub fn update_current_status(&self) -> HashMap<String, (i64, i64)> {
+    pub fn update_current_status(&self) -> Result<HashMap<String, (i64, i64)>, String> {
 
         let mut results: HashMap<String, (i64, i64)> = HashMap::new();
 
@@ -505,17 +513,14 @@ impl Observer {
                 None
         };
 
-        let metadata: Metadata = self
+        let metadata: Metadata = match self
             .client
-            .fetch_metadata(topic, self.get_fetch_timeout())
-            .expect("Failed to fetch metadata");
-
-        // let groups: GroupList = self.client.fetch_group_list(None, Duration::from_secs(20)).unwrap();
-
-        // for item in groups.groups() {
-        //     debug!("Group name: {:}", item.name());
-
-        // }
+            .fetch_metadata(topic, self.get_fetch_timeout()){
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    return Result::Err(String::from("Failed to fetch metadata"))
+                }
+            };
 
         for topic in metadata.topics().iter() {
             if self.topics_set.contains(topic.name()) || self.topics_set.len() == 0 {
@@ -609,7 +614,7 @@ impl Observer {
                 }
             }
         }
-        results
+        Ok(results)
     }
 }
 
